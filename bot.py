@@ -51,6 +51,35 @@ async def send_telegram(text):
 
 async def get_cs2_slugs_from_page():
     try:
+        # Беремо дати і сьогодні і завтра (UTC може відрізнятися від Києва)
+        from datetime import datetime, timezone, timedelta, date
+        now_utc = datetime.now(timezone.utc)
+        dates_to_check = set()
+        for delta in [-1, 0, 1]:  # вчора, сьогодні, завтра
+            d = (now_utc + timedelta(days=delta)).strftime("%Y-%m-%d")
+            dates_to_check.add(d)
+
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(POLYMARKET_URL, headers={"User-Agent": "Mozilla/5.0"})
+            all_slugs = re.findall(r'cs2-[a-z0-9-]+', r.text)
+            seen = set()
+            result = []
+            for slug in all_slugs:
+                parts = slug.split("-")
+                if len(parts) >= 5:
+                    tail = "-".join(parts[-3:])
+                    if re.match(r'^\d{4}-\d{2}-\d{2}$', tail):
+                        if tail in dates_to_check and slug not in seen:
+                            seen.add(slug)
+                            result.append(slug)
+            return result
+    except Exception as e:
+        print(f"Помилка парсингу: {e}")
+        return []
+
+
+async def get_cs2_slugs_from_page_OLD():
+    try:
         today = date.today().strftime("%Y-%m-%d")
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.get(POLYMARKET_URL, headers={"User-Agent": "Mozilla/5.0"})
@@ -467,12 +496,22 @@ async def scan_matches():
                 if not event:
                     continue
 
+                # Пропускаємо закриті/завершені матчі
+                if event.get("closed") or event.get("archived"):
+                    notified_slugs.add(slug)  # Щоб більше не перевіряти
+                    continue
+
                 data = parse_markets(event)
                 series = data.get("series")
                 if not series:
                     continue
 
                 stage = get_match_stage(data)
+
+                # Пропускаємо вже завершені матчі
+                if stage == "finished":
+                    notified_slugs.add(slug)
+                    continue
 
                 # Ініціалізуємо стан
                 match_states[slug] = {
