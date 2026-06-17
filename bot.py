@@ -301,6 +301,18 @@ def ordered_series_prices(series, first_team, second_team):
     return first_price, second_price
 
 
+def format_pair_line(market, first_team=None, second_team=None):
+    if not market:
+        return ""
+    first_team = first_team or market["team1"]
+    second_team = second_team or market["team2"]
+    first_price = price_for_team(market, first_team)
+    second_price = price_for_team(market, second_team)
+    if first_price is None or second_price is None:
+        return f"{market['team1']} {market['price1']}¢ / {market['team2']} {market['price2']}¢"
+    return f"{first_team} {first_price}¢ / {second_team} {second_price}¢"
+
+
 def is_map_winner_market(market_type, question, group_title):
     haystack = f"{question} {group_title}".lower()
     if market_type != "child_moneyline" and "winner" not in haystack:
@@ -602,11 +614,11 @@ async def msg3_map1_done(slug, data):
     winner_k1 = map1.get("winner") if map1 else None
     match_states[slug]["map1_winner"] = winner_k1
 
-    cur_fav, cur_fav_p = (series["team1"], series["price1"]) if series["price1"] >= series["price2"] else (series["team2"], series["price2"])
-    cur_dog, cur_dog_p = (series["team2"], series["price2"]) if series["price1"] >= series["price2"] else (series["team1"], series["price1"])
-
-    band_range, band_data = get_band(cur_fav_p)
-    show_forecast = band_range and 50 <= band_range[0] and band_range[1] <= 80
+    prematch_fav = state.get("prematch_fav") or (
+        series["team1"] if series["price1"] >= series["price2"] else series["team2"]
+    )
+    prematch_fav_price = state.get("prematch_fav_price") or max(series["price1"], series["price2"])
+    band_range, band_data = get_band(prematch_fav_price)
     calc_market = map2 if map2 and not map2.get("winner") else None
     calc_label = "К2"
     if not calc_market and map3 and not map3.get("winner"):
@@ -614,74 +626,64 @@ async def msg3_map1_done(slug, data):
         calc_label = "К3"
 
     msg = f"""🎮 <b>К1 ЗАКІНЧИЛАСЬ!</b>
-⚔️ <b>{title}</b>
-🏆 К1 взяв: <b>{winner_k1 or "невідомо"}</b>
+⚔️ {title}
+🏆 К1 взяв: <b>{winner_k1 or "невідомо"}</b> | 1:0
 
-📈 <b>Серія зараз:</b>
-  {cur_fav} {cur_fav_p}¢ / {cur_dog} {cur_dog_p}¢
-  Об'єм: ${series['volume']:,.0f}"""
-
-    if map2 and 5 < map2["price1"] < 95:
-        msg += f"""
-
-🗺 <b>К2:</b>
-  {map2['team1']} {map2['price1']}¢ / {map2['team2']} {map2['price2']}¢
-  Об'єм: ${map2['volume']:,.0f}"""
-
-    if map3 and map3["volume"] > 0:
-        msg += f"""
-
-🗺 <b>К3 вже є:</b>
-  {map3['team1']} {map3['price1']}¢ / {map3['team2']} {map3['price2']}¢
-  Об'єм: ${map3['volume']:,.0f}"""
+📈 Серія зараз: {format_pair_line(series)}
+"""
 
     if calc_market:
-        team_a = calc_market["team1"]
-        team_b = calc_market["team2"]
+        msg += f"🗺 {calc_label}: {format_pair_line(calc_market)}\n"
+
+    if calc_market:
+        team_a = winner_k1 if winner_k1 in (calc_market["team1"], calc_market["team2"]) else calc_market["team1"]
+        team_b = other_team_in_market(calc_market, team_a) or calc_market["team2"]
         s1, s2 = ordered_series_prices(series, team_a, team_b)
+        team_a_map = price_for_team(calc_market, team_a)
+        team_b_map = price_for_team(calc_market, team_b)
+        split_forecast = forecast_split_prices(series, winner_k1, team_b, state) if winner_k1 else None
+        fav_forecast = split_forecast.get(prematch_fav) if split_forecast else None
+        band_text = f"{band_range[0]}-{band_range[1]}%" if band_range else "поза базою"
+
+        msg += f"""
+
+🤖 Прогноз (база {band_text}, фаворит: {prematch_fav} {prematch_fav_price}¢):"""
+        if split_forecast and fav_forecast is not None:
+            msg += f"""
+  При 1:1 серія {prematch_fav} → ~{fav_forecast}¢"""
+        else:
+            msg += """
+  При 1:1 прогноз серії треба звірити в базі вручну"""
+
         msg += f"""
 
 📋 <b>ЩО ВПИСАТИ В КАЛЬКУЛЯТОР:</b>
-  Ринок 1: <b>{calc_label}</b>
-  Ринок 2: <b>Серія</b>
+Команда A (К1 переможець): <b>{team_a}</b>
+Команда A · Матч ({calc_label}): <b>{team_a_map if team_a_map is not None else "?"}</b>
+Команда A · Серія: <b>{s1 if s1 is not None else "?"}</b>
+Команда B: <b>{team_b}</b>
+Команда B · Матч ({calc_label}): <b>{team_b_map if team_b_map is not None else "?"}</b>
+Команда B · Серія: <b>{s2 if s2 is not None else "?"}</b>
 
-  Команда A: <b>{team_a}</b>
-  A · Матч ({calc_label}): <b>{calc_market['price1']}</b>
-  A · Серія: <b>{s1 if s1 is not None else "?"}</b>
-  Команда B: <b>{team_b}</b>
-  B · Матч ({calc_label}): <b>{calc_market['price2']}</b>
-  B · Серія: <b>{s2 if s2 is not None else "?"}</b>"""
+Якщо <b>{team_a}</b> бере {calc_label} (2:0 sweep):
+  {team_a} серія → <b>100</b>
+  {team_b} серія → <b>0</b>"""
 
-        if winner_k1:
-            for team in (team_a, team_b):
-                other = other_team_in_market(series, team)
-                if team == winner_k1:
-                    msg += f"""
-
-  Якщо <b>{team}</b> бере {calc_label} → sweep 2:0:
-    {team} серія → <b>100</b> / {other} → <b>0</b>"""
-                else:
-                    split_forecast = forecast_split_prices(series, winner_k1, team, state)
-                    if split_forecast and other:
-                        msg += f"""
-
-  Якщо <b>{team}</b> бере {calc_label} → split 1:1:
-    {team} серія → <b>{split_forecast.get(team, "?")}</b> / {other} → <b>{split_forecast.get(other, "?")}</b>
-    База: {split_forecast.get("note", "історична переоцінка")}"""
-                    else:
-                        msg += f"""
-
-  Якщо <b>{team}</b> бере {calc_label} → split 1:1:
-    прогноз серії треба звірити в базі вручну"""
-        elif show_forecast and band_data:
-            revert = band_data["revert"]
+        if split_forecast:
             msg += f"""
 
-  Якщо буде 1:1: {cur_fav} серія → ~<b>{revert}</b> / {cur_dog} → ~<b>{100-revert}</b>"""
-    elif not show_forecast and band_range:
-        msg += f"\n\n⚠️ Прогноз не застосовний: фаворит {cur_fav_p}¢ — поза робочим діапазоном"
+Якщо <b>{team_b}</b> бере {calc_label} (1:1 split):
+  {team_a} серія → <b>{split_forecast.get(team_a, "?")}</b>
+  {team_b} серія → <b>{split_forecast.get(team_b, "?")}</b>"""
+        else:
+            msg += f"""
 
-    msg += "\n\n⚡️ <b>У тебе ~5 хвилин — відкривай калькулятор!</b>"
+Якщо <b>{team_b}</b> бере {calc_label} (1:1 split):
+  прогноз серії треба звірити вручну"""
+    else:
+        msg += "\n⚠️ К2/K3 Winner market не знайдено — калькулятор поки не заповнюємо."
+
+    msg += "\n\n⚡️ У тебе ~5 хвилин!"
     await send_telegram(msg)
     print(f"[3] К1 done: {title}")
 
@@ -697,10 +699,10 @@ async def msg4a_sweep(slug, data):
     winner = series.get("winner") or (series["team1"] if series["price1"] > series["price2"] else series["team2"])
     await send_telegram(
         f"🏆 <b>СЕРІЯ ЗАКІНЧИЛАСЬ! 2:0 SWEEP</b>\n"
-        f"⚔️ <b>{title}</b>\n"
+        f"⚔️ {title}\n"
         f"🥇 Переможець: <b>{winner}</b>\n\n"
         f"✅ Обидві ноги резолвляться автоматично\n"
-        f"💰 Профіт зарахується на рахунок Polymarket"
+        f"💰 Профіт зарахується на рахунок"
     )
     print(f"[4a] Sweep: {title}")
 
@@ -721,25 +723,21 @@ async def msg4b_split(slug, data):
         map2_winner = map2.get("winner")
 
     msg = f"""⚖️ <b>К2 ЗАКІНЧИЛАСЬ! РАХУНОК 1:1</b>
-⚔️ <b>{title}</b>
+⚔️ {title}
 🗺 К2 взяв: <b>{map2_winner or "невідомо"}</b>
 
-📈 <b>Серія зараз:</b>
-  {series['team1']} {series['price1']}¢ / {series['team2']} {series['price2']}¢"""
+📈 Серія зараз: {format_pair_line(series)}"""
 
     if map3 and map3["volume"] > 0:
         msg += f"""
-🗺 <b>К3:</b>
-  {map3['team1']} {map3['price1']}¢ / {map3['team2']} {map3['price2']}¢"""
+🗺 К3: {format_pair_line(map3)}"""
 
     msg += """
 
 ✅ <b>Що робити:</b>
-Нога «К2» резолвиться в 100¢ → профіт зафіксовано
-<b>Продай ногу «СЕРІЯ»</b> по поточній ціні прямо зараз!
-Не чекай К3 — фіксуй гарантований профіт
-
-⚡️ Відкривай Polymarket і продавай ногу серії!"""
+Нога «К2» резолвиться в 100¢ → профіт
+<b>Продай ногу «СЕРІЯ» зараз по поточній ціні!</b>
+Не чекай К3 — фіксуй гарантований профіт"""
 
     await send_telegram(msg)
     print(f"[4b] Split 1:1: {title}")
@@ -782,11 +780,10 @@ async def msg5_final(slug, data):
     winner = series.get("winner") or (series["team1"] if series["price1"] > series["price2"] else series["team2"])
     await send_telegram(
         f"🏁 <b>СЕРІЯ ЗАВЕРШЕНА (К3)</b>\n"
-        f"⚔️ <b>{title}</b>\n"
+        f"⚔️ {title}\n"
         f"🥇 Переможець: <b>{winner}</b>\n"
         f"📊 Рахунок карт: 2:1\n\n"
-        f"✅ Серія нога резолвиться автоматично\n"
-        f"💰 Профіт зарахується на рахунок"
+        f"✅ Серія нога резолвиться автоматично"
     )
     print(f"[5] Фінал К3: {title}")
 
