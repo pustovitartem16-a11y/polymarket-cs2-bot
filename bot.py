@@ -9,6 +9,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 GAMMA_API = "https://gamma-api.polymarket.com"
 POLYMARKET_URL = "https://polymarket.com/sports/esports"
+KYIV_TZ_OFFSET = 3  # UTC+3
 
 BAND_SHIFTS = {
     (50, 55): {"fav_win": 22, "dog_win": -24, "revert": 52},
@@ -28,6 +29,31 @@ match_states = {}
 notified_slugs = set()
 reminder_tasks = {}
 
+KYIV_TZ = timezone(timedelta(hours=KYIV_TZ_OFFSET))
+
+
+def now_kyiv():
+    return datetime.now(KYIV_TZ)
+
+
+def format_kyiv_time(utc_str):
+    """Конвертує UTC рядок в час Києва"""
+    try:
+        dt = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
+        dt_kyiv = dt.astimezone(KYIV_TZ)
+        return dt_kyiv.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return utc_str[:16].replace("T", " ")
+
+
+def seconds_until_start(start_date_str):
+    try:
+        dt = datetime.fromisoformat(start_date_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        return (dt - now).total_seconds()
+    except Exception:
+        return 0
+
 
 def get_band(fav_price):
     for (lo, hi), data in BAND_SHIFTS.items():
@@ -46,19 +72,12 @@ async def send_telegram(text):
                 "parse_mode": "HTML"
             })
     except Exception as e:
-        print(f"Ошибка отправки: {e}")
+        print(f"Помилка відправки: {e}")
 
 
 async def get_cs2_slugs_from_page():
+    """Парсить сторінку і повертає всі CS2 slugs без обмежень по даті"""
     try:
-        # Беремо дати і сьогодні і завтра (UTC може відрізнятися від Києва)
-        from datetime import datetime, timezone, timedelta, date
-        now_utc = datetime.now(timezone.utc)
-        dates_to_check = set()
-        for delta in [-1, 0, 1]:  # вчора, сьогодні, завтра
-            d = (now_utc + timedelta(days=delta)).strftime("%Y-%m-%d")
-            dates_to_check.add(d)
-
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.get(POLYMARKET_URL, headers={"User-Agent": "Mozilla/5.0"})
             all_slugs = re.findall(r'cs2-[a-z0-9-]+', r.text)
@@ -68,35 +87,13 @@ async def get_cs2_slugs_from_page():
                 parts = slug.split("-")
                 if len(parts) >= 5:
                     tail = "-".join(parts[-3:])
-                    if re.match(r'^\d{4}-\d{2}-\d{2}$', tail):
-                        if tail in dates_to_check and slug not in seen:
-                            seen.add(slug)
-                            result.append(slug)
+                    # Основний slug закінчується датою
+                    if re.match(r'^\d{4}-\d{2}-\d{2}$', tail) and slug not in seen:
+                        seen.add(slug)
+                        result.append(slug)
             return result
     except Exception as e:
         print(f"Помилка парсингу: {e}")
-        return []
-
-
-async def get_cs2_slugs_from_page_OLD():
-    try:
-        today = date.today().strftime("%Y-%m-%d")
-        async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get(POLYMARKET_URL, headers={"User-Agent": "Mozilla/5.0"})
-            all_slugs = re.findall(r'cs2-[a-z0-9-]+', r.text)
-            seen = set()
-            result = []
-            for slug in all_slugs:
-                parts = slug.split("-")
-                if len(parts) >= 5:
-                    tail = "-".join(parts[-3:])
-                    if re.match(r'^\d{4}-\d{2}-\d{2}$', tail):
-                        if tail == today and slug not in seen:
-                            seen.add(slug)
-                            result.append(slug)
-            return result
-    except Exception as e:
-        print(f"Ошибка парсинга: {e}")
         return []
 
 
@@ -108,7 +105,7 @@ async def get_event_by_slug(slug):
             if data and isinstance(data, list):
                 return data[0]
     except Exception as e:
-        print(f"Ошибка get_event({slug}): {e}")
+        print(f"Помилка get_event({slug}): {e}")
     return None
 
 
@@ -195,27 +192,6 @@ def get_match_stage(data):
     return "before"
 
 
-def format_start_time(start_date_str):
-    """Форматирует время начала матча"""
-    try:
-        dt = datetime.fromisoformat(start_date_str.replace("Z", "+00:00"))
-        # Конвертируем в UTC+3 (Киев)
-        dt_kyiv = dt + timedelta(hours=3)
-        return dt_kyiv.strftime("%d.%m.%Y %H:%M")
-    except Exception:
-        return start_date_str[:16].replace("T", " ")
-
-
-def seconds_until_start(start_date_str):
-    """Секунд до начала матча"""
-    try:
-        dt = datetime.fromisoformat(start_date_str.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-        return (dt - now).total_seconds()
-    except Exception:
-        return 0
-
-
 # ============================================================
 # ПОВІДОМЛЕННЯ 1 — Матч знайдено
 # ============================================================
@@ -223,7 +199,7 @@ async def msg1_match_found(slug, data):
     series = data.get("series")
     map1 = data.get("map1")
     title = data.get("title", slug)
-    start = format_start_time(data.get("start_date", ""))
+    start = format_kyiv_time(data.get("start_date", ""))
 
     fav_price = max(series["price1"], series["price2"])
     band_range, _ = get_band(fav_price)
@@ -234,7 +210,7 @@ async def msg1_match_found(slug, data):
 
     msg = f"""🔍 <b>ЗНАЙДЕНО CS2 МАТЧ</b>
 ⚔️ <b>{title}</b>
-🕐 Початок: {start}
+🕐 Початок (Київ): {start}
 
 📊 <b>Серія:</b> {series['team1']} {series['price1']}¢ / {series['team2']} {series['price2']}¢
 💧 Об'єм серії: ${series['volume']:,.0f}"""
@@ -243,16 +219,14 @@ async def msg1_match_found(slug, data):
         msg += f"\n💧 Об'єм К1: ${map1_liq:,.0f}"
 
     msg += f"\n\n{verdict_icon} <b>Вердикт:</b> {verdict}"
-
     await send_telegram(msg)
-    print(f"[1 ЗНАЙДЕНО] {title}")
+    print(f"[1 ЗНАЙДЕНО] {title} | Старт: {start}")
 
 
 # ============================================================
 # ПОВІДОМЛЕННЯ 2 — Нагадування за 30 хвилин
 # ============================================================
 async def msg2_reminder_30min(slug):
-    """Чекає і надсилає нагадування за 30 хвилин до початку"""
     event = await get_event_by_slug(slug)
     if not event:
         return
@@ -266,11 +240,9 @@ async def msg2_reminder_30min(slug):
 
     fav_price = max(series["price1"], series["price2"])
     if series["price1"] >= series["price2"]:
-        fav_name = series["team1"]
-        dog_name = series["team2"]
+        fav_name, dog_name = series["team1"], series["team2"]
     else:
-        fav_name = series["team2"]
-        dog_name = series["team1"]
+        fav_name, dog_name = series["team2"], series["team1"]
 
     band_range, band_data = get_band(fav_price)
     map1_liq = map1["volume"] if map1 else 0
@@ -304,15 +276,11 @@ async def msg2_reminder_30min(slug):
 
 
 async def schedule_reminder(slug, start_date_str):
-    """Планує нагадування за 30 хвилин до початку"""
     secs = seconds_until_start(start_date_str)
-    delay = secs - 30 * 60  # За 30 хвилин до початку
-
+    delay = secs - 30 * 60
     if delay > 0:
         print(f"[ПЛАН] Нагадування через {delay:.0f}с для {slug}")
         await asyncio.sleep(delay)
-
-    # Перевіряємо що матч ще не почався
     stage = match_states.get(slug, {}).get("stage", "before")
     if stage in ["before", "map1_live"]:
         await msg2_reminder_30min(slug)
@@ -330,7 +298,6 @@ async def msg3_map1_done(slug, data):
     if not series or series["volume"] < MIN_SERIES_LIQUIDITY:
         return
 
-    # Визначаємо переможця К1
     winner_k1 = None
     if map1:
         winner_k1 = map1.get("winner") or (
@@ -338,7 +305,6 @@ async def msg3_map1_done(slug, data):
         )
     match_states[slug]["map1_winner"] = winner_k1
 
-    # Поточний фаворит серії
     if series["price1"] >= series["price2"]:
         cur_fav, cur_fav_p = series["team1"], series["price1"]
         cur_dog, cur_dog_p = series["team2"], series["price2"]
@@ -364,7 +330,6 @@ async def msg3_map1_done(slug, data):
   {map2['team1']} {map2['price1']}¢ / {map2['team2']} {map2['price2']}¢
   Об'єм: ${map2['volume']:,.0f}"""
 
-    # Прогноз тільки якщо діапазон підходящий
     if show_forecast and band_data:
         revert = band_data["revert"]
         msg += f"""
@@ -372,23 +337,27 @@ async def msg3_map1_done(slug, data):
 🤖 <b>Прогноз (база {band_range[0]}-{band_range[1]}%):</b>
   При 1:1 серія {cur_fav} → ~{revert}¢"""
 
-        # Що вписати в калькулятор
         if map2 and 5 < map2["price1"] < 95:
+            s_price1 = series["price1"] if series["team1"] == map2["team1"] else series["price2"]
+            s_price2 = series["price2"] if series["team2"] == map2["team2"] else series["price1"]
+
             msg += f"""
 
 📋 <b>ЩО ВПИСАТИ В КАЛЬКУЛЯТОР:</b>
   Команда A: <b>{map2['team1']}</b>
-  Команда A · Матч (К2): <b>{map2['price1']}</b>
-  Команда A · Серія: <b>{series['price1'] if series['team1'] == map2['team1'] else series['price2']}</b>
+  A · Матч (К2 ціна): <b>{map2['price1']}</b>
+  A · Серія: <b>{s_price1}</b>
   Команда B: <b>{map2['team2']}</b>
-  Команда B · Матч (К2): <b>{map2['price2']}</b>
-  Команда B · Серія: <b>{series['price2'] if series['team2'] == map2['team2'] else series['price1']}</b>
+  B · Матч (К2 ціна): <b>{map2['price2']}</b>
+  B · Серія: <b>{s_price2}</b>
 
-  Якщо <b>{cur_fav}</b> бере К2 (2:0 sweep):
-    {cur_fav} серія → <b>100</b> / {cur_dog} серія → <b>0</b>
+  Якщо <b>{cur_fav}</b> бере К2 (sweep 2:0):
+    {cur_fav} серія → <b>100</b>
+    {cur_dog} серія → <b>0</b>
 
-  Якщо <b>{cur_dog}</b> бере К2 (1:1 split):
-    {cur_fav} серія → <b>{revert}</b> / {cur_dog} серія → <b>{100 - revert}</b>"""
+  Якщо <b>{cur_dog}</b> бере К2 (split 1:1):
+    {cur_fav} серія → <b>{revert}</b>
+    {cur_dog} серія → <b>{100 - revert}</b>"""
 
     elif not show_forecast and band_range:
         msg += f"\n\n⚠️ Прогноз не застосовний: фаворит {cur_fav_p}¢ — поза робочим діапазоном стратегії"
@@ -399,7 +368,7 @@ async def msg3_map1_done(slug, data):
 
 
 # ============================================================
-# ПОВІДОМЛЕННЯ 4a — Після К2 sweep 2:0
+# ПОВІДОМЛЕННЯ 4a — Sweep 2:0
 # ============================================================
 async def msg4a_sweep(slug, data):
     series = data.get("series")
@@ -418,7 +387,7 @@ async def msg4a_sweep(slug, data):
 
 
 # ============================================================
-# ПОВІДОМЛЕННЯ 4b — Після К2 split 1:1
+# ПОВІДОМЛЕННЯ 4b — Split 1:1
 # ============================================================
 async def msg4b_split(slug, data):
     series = data.get("series")
@@ -428,10 +397,11 @@ async def msg4b_split(slug, data):
     if not series:
         return
 
-    map1_winner = match_states.get(slug, {}).get("map1_winner")
-    map2_winner = map2.get("winner") if map2 else None
-    if not map2_winner and map2:
-        map2_winner = map2["team1"] if map2["price1"] >= 95 else map2["team2"]
+    map2_winner = None
+    if map2:
+        map2_winner = map2.get("winner") or (
+            map2["team1"] if map2["price1"] >= 95 else map2["team2"]
+        )
 
     msg = f"""⚖️ <b>К2 ЗАКІНЧИЛАСЬ! РАХУНОК 1:1</b>
 ⚔️ <b>{title}</b>
@@ -459,7 +429,7 @@ async def msg4b_split(slug, data):
 
 
 # ============================================================
-# ПОВІДОМЛЕННЯ 5 — Після К3 (фінал серії)
+# ПОВІДОМЛЕННЯ 5 — Фінал після К3
 # ============================================================
 async def msg5_final(slug, data):
     series = data.get("series")
@@ -467,7 +437,6 @@ async def msg5_final(slug, data):
     if not series:
         return
     winner = series["team1"] if series["price1"] >= 95 else series["team2"]
-    loser = series["team2"] if series["price1"] >= 95 else series["team1"]
     await send_telegram(
         f"🏁 <b>СЕРІЯ ЗАВЕРШЕНА (К3)</b>\n"
         f"⚔️ <b>{title}</b>\n"
@@ -476,7 +445,7 @@ async def msg5_final(slug, data):
         f"✅ Серія нога резолвиться автоматично\n"
         f"💰 Профіт зарахується на рахунок"
     )
-    print(f"[5 ФІНАЛ К3] {title}: {winner}")
+    print(f"[5 К3] {title}: {winner}")
 
 
 # ============================================================
@@ -486,7 +455,7 @@ async def scan_matches():
     while True:
         try:
             slugs = await get_cs2_slugs_from_page()
-            print(f"[SCAN] Знайдено: {len(slugs)} slugs")
+            print(f"[SCAN] Знайдено slugs: {len(slugs)}")
 
             for slug in slugs:
                 if slug in notified_slugs:
@@ -496,9 +465,9 @@ async def scan_matches():
                 if not event:
                     continue
 
-                # Пропускаємо закриті/завершені матчі
+                # Пропускаємо закриті/заархівовані матчі
                 if event.get("closed") or event.get("archived"):
-                    notified_slugs.add(slug)  # Щоб більше не перевіряти
+                    notified_slugs.add(slug)
                     continue
 
                 data = parse_markets(event)
@@ -508,12 +477,11 @@ async def scan_matches():
 
                 stage = get_match_stage(data)
 
-                # Пропускаємо вже завершені матчі
+                # Пропускаємо вже завершені
                 if stage == "finished":
                     notified_slugs.add(slug)
                     continue
 
-                # Ініціалізуємо стан
                 match_states[slug] = {
                     "title": data["title"],
                     "start_date": data.get("start_date", ""),
@@ -522,25 +490,25 @@ async def scan_matches():
                     "notified_map1": False,
                     "notified_map2": False,
                     "notified_final": False,
+                    "was_sweep": False,
                 }
                 notified_slugs.add(slug)
 
                 # Повідомлення 1 — завжди при знаходженні
-                if series["volume"] >= MIN_SERIES_LIQUIDITY:
-                    await msg1_match_found(slug, data)
+                await msg1_match_found(slug, data)
 
-                    # Плануємо нагадування за 30 хвилин якщо матч ще не почався
-                    if stage == "before":
-                        task = asyncio.create_task(
-                            schedule_reminder(slug, data.get("start_date", ""))
-                        )
-                        reminder_tasks[slug] = task
-                    elif stage == "map1_live":
-                        # Матч вже йде — надсилаємо нагадування одразу
-                        await msg2_reminder_30min(slug)
+                # Плануємо нагадування за 30 хвилин
+                if stage == "before":
+                    task = asyncio.create_task(
+                        schedule_reminder(slug, data.get("start_date", ""))
+                    )
+                    reminder_tasks[slug] = task
+                elif stage == "map1_live":
+                    # Матч вже йде — надсилаємо нагадування одразу
+                    await msg2_reminder_30min(slug)
 
         except Exception as e:
-            print(f"Ошибка scan_matches: {e}")
+            print(f"Помилка scan_matches: {e}")
 
         await asyncio.sleep(120)
 
@@ -571,7 +539,8 @@ async def check_active_matches():
                 state["stage"] = stage
 
                 # К1 закінчилась
-                if stage in ["map1_done", "map2_live", "map2_done_sweep", "map2_done_split", "map3_live", "finished"] \
+                if stage in ["map1_done", "map2_live", "map2_done_sweep",
+                             "map2_done_split", "map3_live", "finished"] \
                         and prev_stage in ["before", "map1_live"] \
                         and not state["notified_map1"]:
                     state["notified_map1"] = True
@@ -581,6 +550,7 @@ async def check_active_matches():
                 elif stage == "map2_done_sweep" and not state["notified_map2"]:
                     state["notified_map2"] = True
                     state["notified_final"] = True
+                    state["was_sweep"] = True
                     await msg4a_sweep(slug, data)
 
                 # К2 закінчилась — split 1:1
@@ -591,12 +561,11 @@ async def check_active_matches():
                 # Серія завершена після К3
                 elif stage == "finished" and not state["notified_final"]:
                     state["notified_final"] = True
-                    # Тільки якщо була К3 (не sweep)
                     if state.get("notified_map2") and not state.get("was_sweep"):
                         await msg5_final(slug, data)
 
         except Exception as e:
-            print(f"Ошибка check_active_matches: {e}")
+            print(f"Помилка check_active_matches: {e}")
 
         await asyncio.sleep(90)
 
@@ -605,13 +574,16 @@ async def check_active_matches():
 # ЗАПУСК
 # ============================================================
 async def main():
-    print("Бот запущений...")
+    kyiv_time = now_kyiv().strftime("%d.%m.%Y %H:%M")
+    print(f"Бот запущений. Час Київ: {kyiv_time}")
+
     await send_telegram(
-        "✅ <b>Polymarket CS2 бот запущений!</b>\n\n"
+        f"✅ <b>Polymarket CS2 бот запущений!</b>\n"
+        f"🕐 Час Київ: {kyiv_time}\n\n"
         "Буду надсилати:\n"
-        "🔍 Повід. 1 — матч знайдено\n"
-        "⏰ Повід. 2 — нагадування за 30 хв\n"
-        "🎮 Повід. 3 — після К1 (що вписати в калькулятор)\n"
+        "🔍 Повід. 1 — матч знайдено (всі CS2 матчі)\n"
+        "⏰ Повід. 2 — нагадування за 30 хв до початку\n"
+        "🎮 Повід. 3 — після К1 + що вписати в калькулятор\n"
         "🏆 Повід. 4 — після К2 (sweep або 1:1)\n"
         "🏁 Повід. 5 — фінал серії після К3"
     )
