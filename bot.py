@@ -653,6 +653,24 @@ async def scan_matches():
 
                 if series["volume"] >= MIN_SERIES_LIQUIDITY:
                     await msg1_match_found(slug, data)
+
+                    # Якщо бот уперше побачив матч уже після К1/К2, не стрибаємо
+                    # одразу в повідомлення про К2 без контексту.
+                    if stage in ["map1_done", "map2_live", "map2_done_sweep",
+                                 "map2_done_split", "map3_live"] \
+                            and not match_states[slug]["notified_map1"]:
+                        match_states[slug]["notified_map1"] = True
+                        await msg3_map1_done(slug, data)
+
+                    if stage == "map2_done_sweep" and not match_states[slug]["notified_map2"]:
+                        match_states[slug]["notified_map2"] = True
+                        match_states[slug]["notified_final"] = True
+                        match_states[slug]["was_sweep"] = True
+                        await msg4a_sweep(slug, data)
+
+                    if stage == "map2_done_split" and not match_states[slug]["notified_map2"]:
+                        match_states[slug]["notified_map2"] = True
+                        await msg4b_split(slug, data)
                 else:
                     print(f"[REMINDER ONLY] Мало ліквідності ${series['volume']:,.0f}: {data['title']}")
 
