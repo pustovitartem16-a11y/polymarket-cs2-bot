@@ -475,17 +475,20 @@ async def scan_matches():
                 }
                 notified_slugs.add(slug)
 
-                # Повідомлення 1
-                await msg1_match_found(slug, data)
+                # Повідомлення 1 — тільки якщо достатньо ліквідності
+                if series["volume"] >= MIN_SERIES_LIQUIDITY:
+                    await msg1_match_found(slug, data)
 
-                # Планування нагадування за 30 хв
-                if stage == "before":
-                    task = asyncio.create_task(
-                        schedule_reminder(slug, data.get("start_date", ""))
-                    )
-                    reminder_tasks[slug] = task
-                elif stage == "map1_live":
-                    await msg2_reminder(slug)
+                    # Планування нагадування за 30 хв
+                    if stage == "before":
+                        task = asyncio.create_task(
+                            schedule_reminder(slug, data.get("start_date", ""))
+                        )
+                        reminder_tasks[slug] = task
+                    elif stage == "map1_live":
+                        await msg2_reminder(slug)
+                else:
+                    print(f"[SKIP] Мало ліквідності ${series['volume']:,.0f}: {data['title']}")
 
         except Exception as e:
             print(f"Помилка scan: {e}")
