@@ -301,6 +301,14 @@ def ordered_series_prices(series, first_team, second_team):
     return first_price, second_price
 
 
+def is_map_winner_market(market_type, question, group_title):
+    haystack = f"{question} {group_title}".lower()
+    if market_type != "child_moneyline" and "winner" not in haystack:
+        return False
+    blocked_words = ["total", "over/under", "handicap", "round"]
+    return not any(word in haystack for word in blocked_words)
+
+
 def map_number_from_market_text(question, group_title, slug):
     haystack = f"{question} {group_title} {slug}".lower()
     for number in (1, 2, 3):
@@ -309,8 +317,6 @@ def map_number_from_market_text(question, group_title, slug):
             f"map{number} winner",
             f"game {number} winner",
             f"game{number} winner",
-            f"game{number}",
-            f"-game{number}",
         ]
         if any(pattern in haystack for pattern in patterns):
             return number
@@ -370,6 +376,38 @@ def forecast_split_prices(series, map1_winner, split_winner, state):
     }
 
 
+def verdict_details(series, map1, band_range):
+    reasons = []
+    if not band_range:
+        reasons.append("немає робочого діапазону фаворита")
+    elif band_range[0] > 70:
+        reasons.append(f"фаворит {band_range[0]}-{band_range[1]}% вище робочої зони")
+
+    if not series or series["volume"] < MIN_SERIES_LIQUIDITY:
+        volume = series["volume"] if series else 0
+        reasons.append(f"об'єм серії ${volume:,.0f} < ${MIN_SERIES_LIQUIDITY:,.0f}")
+
+    if not map1:
+        reasons.append("К1 Winner market не знайдено")
+    elif map1["volume"] < MIN_MAP_LIQUIDITY:
+        reasons.append(f"об'єм К1 ${map1['volume']:,.0f} < ${MIN_MAP_LIQUIDITY:,.0f}")
+
+    return not reasons, reasons
+
+
+def format_map_prices(data):
+    lines = []
+    for key, label in (("map1", "К1"), ("map2", "К2"), ("map3", "К3")):
+        market = data.get(key)
+        if not market:
+            continue
+        lines.append(
+            f"🗺 <b>{label}:</b> {market['team1']} {market['price1']}¢ / "
+            f"{market['team2']} {market['price2']}¢"
+        )
+    return "\n".join(lines)
+
+
 def parse_markets(event):
     markets = event.get("markets", [])
     result = {
@@ -409,15 +447,16 @@ def parse_markets(event):
             "token_ids": token_ids,
             "price_source": "gamma",
         }
-        map_number = map_number_from_market_text(question, group_title, slug)
         if is_series_market:
             result["series"] = md
-        elif map_number == 1:
-            result["map1"] = md
-        elif map_number == 2:
-            result["map2"] = md
-        elif map_number == 3:
-            result["map3"] = md
+        elif is_map_winner_market(market_type, question, group_title):
+            map_number = map_number_from_market_text(question, group_title, slug)
+            if map_number == 1:
+                result["map1"] = md
+            elif map_number == 2:
+                result["map2"] = md
+            elif map_number == 3:
+                result["map3"] = md
     return result
 
 
@@ -471,20 +510,25 @@ async def msg1_match_found(slug, data):
     start = format_kyiv_time(data.get("start_date", ""))
     fav_price = max(series["price1"], series["price2"])
     band_range, _ = get_band(fav_price)
-    map1_liq = map1["volume"] if map1 else 0
-    liq_ok = series["volume"] >= MIN_SERIES_LIQUIDITY and map1_liq >= MIN_MAP_LIQUIDITY and band_range and band_range[0] <= 70
+    liq_ok, reasons = verdict_details(series, map1, band_range)
     verdict_icon = "✅" if liq_ok else "⚠️"
-    verdict = "Кандидат для торгівлі" if liq_ok else "Пропустити"
+    verdict = "Кандидат для спостереження" if liq_ok else "Не кандидат"
+    details = "" if liq_ok else "\nПричини: " + "; ".join(reasons)
 
     msg = f"""🔍 <b>ЗНАЙДЕНО CS2 МАТЧ</b>
 ⚔️ <b>{title}</b>
 🕐 Початок (Київ): {start}
 
 📊 <b>Серія:</b> {series['team1']} {series['price1']}¢ / {series['team2']} {series['price2']}¢
-💧 Об'єм серії: ${series['volume']:,.0f}
-💧 Об'єм К1: ${map1_liq:,.0f}
+💧 Об'єм серії: ${series['volume']:,.0f}"""
 
-{verdict_icon} <b>Вердикт:</b> {verdict}"""
+    map_lines = format_map_prices(data)
+    if map_lines:
+        msg += f"\n{map_lines}"
+
+    msg += f"""
+
+{verdict_icon} <b>Вердикт:</b> {verdict}{details}"""
 
     await send_telegram(msg)
     print(f"[1] {title} | {start} | {verdict}")
@@ -504,11 +548,8 @@ async def msg2_reminder(slug):
         return
 
     fav_price = max(series["price1"], series["price2"])
-    fav_name = series["team1"] if series["price1"] >= series["price2"] else series["team2"]
-    dog_name = series["team2"] if series["price1"] >= series["price2"] else series["team1"]
-    band_range, band_data = get_band(fav_price)
-    map1_liq = map1["volume"] if map1 else 0
-    liq_ok = map1_liq >= MIN_MAP_LIQUIDITY and band_range and band_range[0] <= 70
+    band_range, _ = get_band(fav_price)
+    liq_ok, reasons = verdict_details(series, map1, band_range)
 
     msg = f"""⏰ <b>МАТЧ ЧЕРЕЗ 30 ХВИЛИН!</b>
 ⚔️ <b>{title}</b>
@@ -516,19 +557,17 @@ async def msg2_reminder(slug):
 📊 <b>Серія:</b> {series['team1']} {series['price1']}¢ / {series['team2']} {series['price2']}¢
 💧 Об'єм серії: ${series['volume']:,.0f}"""
 
-    if map1:
-        msg += f"""
-🗺 <b>К1:</b> {map1['team1']} {map1['price1']}¢ / {map1['team2']} {map1['price2']}¢
-💧 Об'єм К1: ${map1_liq:,.0f}"""
+    map_lines = format_map_prices(data)
+    if map_lines:
+        msg += f"\n{map_lines}"
 
-    if band_range and band_data:
-        msg += f"""
+    if liq_ok:
+        msg += "\n\n✅ <b>Вердикт:</b> Кандидат — чекаємо завершення К1"
+    else:
+        msg += "\n\n⚠️ <b>Вердикт:</b> Не кандидат"
+        msg += "\nПричини: " + "; ".join(reasons)
 
-📉 <b>Діапазон фаворита ({fav_name}):</b> {band_range[0]}-{band_range[1]}%
-   Якщо {fav_name} бере К1: серія +{band_data['fav_win']}
-   Якщо {dog_name} бере К1: серія {band_data['dog_win']}"""
-
-    msg += f"\n\n{'✅' if liq_ok else '⚠️'} <b>Вердикт:</b> {'Кандидат — слідкуй за К1!' if liq_ok else 'Пропустити (мало ліквідності К1)'}"
+    msg += "\n\n📌 Прогноз і числа для калькулятора прийдуть після К1."
 
     await send_telegram(msg)
     print(f"[2] {title}")
