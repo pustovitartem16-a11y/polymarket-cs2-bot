@@ -275,6 +275,101 @@ def is_live_market(market_data):
     return 5 < market_data["price1"] < 95 and 5 < market_data["price2"] < 95
 
 
+def price_for_team(market_data, team):
+    if not market_data or not team:
+        return None
+    if market_data["team1"] == team:
+        return market_data["price1"]
+    if market_data["team2"] == team:
+        return market_data["price2"]
+    return None
+
+
+def other_team_in_market(market_data, team):
+    if not market_data or not team:
+        return None
+    if market_data["team1"] == team:
+        return market_data["team2"]
+    if market_data["team2"] == team:
+        return market_data["team1"]
+    return None
+
+
+def ordered_series_prices(series, first_team, second_team):
+    first_price = price_for_team(series, first_team)
+    second_price = price_for_team(series, second_team)
+    return first_price, second_price
+
+
+def map_number_from_market_text(question, group_title, slug):
+    haystack = f"{question} {group_title} {slug}".lower()
+    for number in (1, 2, 3):
+        patterns = [
+            f"map {number} winner",
+            f"map{number} winner",
+            f"game {number} winner",
+            f"game{number} winner",
+            f"game{number}",
+            f"-game{number}",
+        ]
+        if any(pattern in haystack for pattern in patterns):
+            return number
+    return None
+
+
+def map2_result(data):
+    map1 = data.get("map1")
+    map2 = data.get("map2")
+    if not map1 or not map2:
+        return None
+    map1_winner = map1.get("winner")
+    map2_winner = map2.get("winner")
+    if not map1_winner or not map2_winner:
+        return None
+    return "sweep" if map1_winner == map2_winner else "split"
+
+
+def forecast_split_prices(series, map1_winner, split_winner, state):
+    if not series or not map1_winner or not split_winner:
+        return None
+
+    prematch_fav = state.get("prematch_fav")
+    prematch_fav_price = state.get("prematch_fav_price")
+    if not prematch_fav:
+        prematch_fav, prematch_fav_price = (
+            (series["team1"], series["price1"])
+            if series["price1"] >= series["price2"]
+            else (series["team2"], series["price2"])
+        )
+
+    _, band_data = get_band(prematch_fav_price)
+    if not band_data:
+        return None
+
+    if map1_winner == prematch_fav:
+        fav_forecast = band_data["revert"]
+        note = "фаворит взяв К1, інша команда зрівнює 1:1"
+    else:
+        # Коли андердог забрав К1, а фаворит зрівнює К2, база повертається
+        # ближче до прематчевої ціни, зазвичай з меншою корекцією.
+        correction = 2 if prematch_fav_price < 70 else 4
+        fav_forecast = max(50, min(95, round(prematch_fav_price - correction)))
+        note = "андердог взяв К1, фаворит зрівнює 1:1"
+
+    other = other_team_in_market(series, prematch_fav)
+    if split_winner == prematch_fav:
+        return {
+            prematch_fav: fav_forecast,
+            other: 100 - fav_forecast,
+            "note": note,
+        }
+    return {
+        prematch_fav: fav_forecast,
+        other: 100 - fav_forecast,
+        "note": note,
+    }
+
+
 def parse_markets(event):
     markets = event.get("markets", [])
     result = {
@@ -286,6 +381,7 @@ def parse_markets(event):
         question = m.get("question", "").lower()
         market_type = (m.get("sportsMarketType") or "").lower()
         group_title = (m.get("groupItemTitle") or "").lower()
+        slug = (m.get("slug") or "").lower()
         volume = float(m.get("volumeNum", 0) or 0)
         outcomes = m.get("outcomes", "[]")
         prices_str = m.get("outcomePrices", "[]")
@@ -313,13 +409,14 @@ def parse_markets(event):
             "token_ids": token_ids,
             "price_source": "gamma",
         }
+        map_number = map_number_from_market_text(question, group_title, slug)
         if is_series_market:
             result["series"] = md
-        elif group_title == "map 1 winner" or "map 1 winner" in question or "map1 winner" in question:
+        elif map_number == 1:
             result["map1"] = md
-        elif group_title == "map 2 winner" or "map 2 winner" in question or "map2 winner" in question:
+        elif map_number == 2:
             result["map2"] = md
-        elif group_title == "map 3 winner" or "map 3 winner" in question or "map3 winner" in question:
+        elif map_number == 3:
             result["map3"] = md
     return result
 
@@ -342,6 +439,8 @@ def get_match_stage(data):
         if map1_winner and map1_winner == map2_winner:
             return "map2_done_sweep"
         if map1_winner and map1_winner != map2_winner:
+            if is_live_market(map3):
+                return "map3_live"
             return "map2_done_split"
         return "map2_done_sweep" if max(series["price1"], series["price2"]) >= 90 else "map2_done_split"
 
@@ -455,10 +554,12 @@ async def msg3_map1_done(slug, data):
     series = data.get("series")
     map1 = data.get("map1")
     map2 = data.get("map2")
+    map3 = data.get("map3")
     title = data.get("title", slug)
     if not series or series["volume"] < MIN_SERIES_LIQUIDITY:
         return
 
+    state = match_states.get(slug, {})
     winner_k1 = map1.get("winner") if map1 else None
     match_states[slug]["map1_winner"] = winner_k1
 
@@ -467,6 +568,11 @@ async def msg3_map1_done(slug, data):
 
     band_range, band_data = get_band(cur_fav_p)
     show_forecast = band_range and 50 <= band_range[0] and band_range[1] <= 80
+    calc_market = map2 if map2 and not map2.get("winner") else None
+    calc_label = "К2"
+    if not calc_market and map3 and not map3.get("winner"):
+        calc_market = map3
+        calc_label = "К3"
 
     msg = f"""🎮 <b>К1 ЗАКІНЧИЛАСЬ!</b>
 ⚔️ <b>{title}</b>
@@ -483,30 +589,56 @@ async def msg3_map1_done(slug, data):
   {map2['team1']} {map2['price1']}¢ / {map2['team2']} {map2['price2']}¢
   Об'єм: ${map2['volume']:,.0f}"""
 
-    if show_forecast and band_data:
-        revert = band_data["revert"]
+    if map3 and map3["volume"] > 0:
         msg += f"""
 
-🤖 <b>Прогноз (база {band_range[0]}-{band_range[1]}%):</b>
-  При 1:1 серія {cur_fav} → ~{revert}¢
+🗺 <b>К3 вже є:</b>
+  {map3['team1']} {map3['price1']}¢ / {map3['team2']} {map3['price2']}¢
+  Об'єм: ${map3['volume']:,.0f}"""
 
-📋 <b>ЩО ВПИСАТИ В КАЛЬКУЛЯТОР:</b>"""
+    if calc_market:
+        team_a = calc_market["team1"]
+        team_b = calc_market["team2"]
+        s1, s2 = ordered_series_prices(series, team_a, team_b)
+        msg += f"""
 
-        if map2 and 5 < map2["price1"] < 95:
-            s1 = series["price1"] if series["team1"] == map2["team1"] else series["price2"]
-            s2 = series["price2"] if series["team2"] == map2["team2"] else series["price1"]
+📋 <b>ЩО ВПИСАТИ В КАЛЬКУЛЯТОР:</b>
+  Ринок 1: <b>{calc_label}</b>
+  Ринок 2: <b>Серія</b>
+
+  Команда A: <b>{team_a}</b>
+  A · Матч ({calc_label}): <b>{calc_market['price1']}</b>
+  A · Серія: <b>{s1 if s1 is not None else "?"}</b>
+  Команда B: <b>{team_b}</b>
+  B · Матч ({calc_label}): <b>{calc_market['price2']}</b>
+  B · Серія: <b>{s2 if s2 is not None else "?"}</b>"""
+
+        if winner_k1:
+            for team in (team_a, team_b):
+                other = other_team_in_market(series, team)
+                if team == winner_k1:
+                    msg += f"""
+
+  Якщо <b>{team}</b> бере {calc_label} → sweep 2:0:
+    {team} серія → <b>100</b> / {other} → <b>0</b>"""
+                else:
+                    split_forecast = forecast_split_prices(series, winner_k1, team, state)
+                    if split_forecast and other:
+                        msg += f"""
+
+  Якщо <b>{team}</b> бере {calc_label} → split 1:1:
+    {team} серія → <b>{split_forecast.get(team, "?")}</b> / {other} → <b>{split_forecast.get(other, "?")}</b>
+    База: {split_forecast.get("note", "історична переоцінка")}"""
+                    else:
+                        msg += f"""
+
+  Якщо <b>{team}</b> бере {calc_label} → split 1:1:
+    прогноз серії треба звірити в базі вручну"""
+        elif show_forecast and band_data:
+            revert = band_data["revert"]
             msg += f"""
-  Команда A: <b>{map2['team1']}</b>
-  A · Матч (К2): <b>{map2['price1']}</b>
-  A · Серія: <b>{s1}</b>
-  Команда B: <b>{map2['team2']}</b>
-  B · Матч (К2): <b>{map2['price2']}</b>
-  B · Серія: <b>{s2}</b>
 
-  Якщо <b>{cur_fav}</b> бере К2 → sweep 2:0:
-    {cur_fav} серія → <b>100</b> / {cur_dog} → <b>0</b>
-  Якщо <b>{cur_dog}</b> бере К2 → split 1:1:
-    {cur_fav} серія → <b>{revert}</b> / {cur_dog} → <b>{100-revert}</b>"""
+  Якщо буде 1:1: {cur_fav} серія → ~<b>{revert}</b> / {cur_dog} → ~<b>{100-revert}</b>"""
     elif not show_forecast and band_range:
         msg += f"\n\n⚠️ Прогноз не застосовний: фаворит {cur_fav_p}¢ — поза робочим діапазоном"
 
@@ -575,6 +707,32 @@ async def msg4b_split(slug, data):
 
 
 # ============================================================
+# ПОВІДОМЛЕННЯ 4c — К3 з'явилась / лайв
+# ============================================================
+async def msg4c_map3_live(slug, data):
+    series = data.get("series")
+    map3 = data.get("map3")
+    title = data.get("title", slug)
+    if not series or not map3:
+        return
+
+    msg = f"""🗺 <b>К3 ДОСТУПНА / ЛАЙВ</b>
+⚔️ <b>{title}</b>
+
+📈 <b>Серія:</b>
+  {series['team1']} {series['price1']}¢ / {series['team2']} {series['price2']}¢
+
+🗺 <b>К3:</b>
+  {map3['team1']} {map3['price1']}¢ / {map3['team2']} {map3['price2']}¢
+  Об'єм: ${map3['volume']:,.0f}
+
+⚡️ Якщо ти ще не закрив серію після 1:1 — перевір ціну прямо зараз."""
+
+    await send_telegram(msg)
+    print(f"[4c] K3 live: {title}")
+
+
+# ============================================================
 # ПОВІДОМЛЕННЯ 5 — Фінал після К3
 # ============================================================
 async def msg5_final(slug, data):
@@ -637,8 +795,13 @@ async def scan_matches():
                     "notified_map1": False,
                     "notified_reminder": False,
                     "notified_map2": False,
+                    "notified_map3": False,
                     "notified_final": False,
                     "was_sweep": False,
+                    "prematch_fav": series["team1"] if series["price1"] >= series["price2"] else series["team2"],
+                    "prematch_fav_price": max(series["price1"], series["price2"]),
+                    "prematch_dog": series["team2"] if series["price1"] >= series["price2"] else series["team1"],
+                    "prematch_dog_price": min(series["price1"], series["price2"]),
                 }
                 notified_slugs.add(slug)
 
@@ -668,9 +831,18 @@ async def scan_matches():
                         match_states[slug]["was_sweep"] = True
                         await msg4a_sweep(slug, data)
 
-                    if stage == "map2_done_split" and not match_states[slug]["notified_map2"]:
+                    if stage in ["map2_done_split", "map3_live"] \
+                            and map2_result(data) == "split" \
+                            and not match_states[slug]["notified_map2"]:
                         match_states[slug]["notified_map2"] = True
                         await msg4b_split(slug, data)
+                        if data.get("map3"):
+                            match_states[slug]["notified_map3"] = True
+
+                    if stage == "map3_live" and data.get("map3") \
+                            and not match_states[slug]["notified_map3"]:
+                        match_states[slug]["notified_map3"] = True
+                        await msg4c_map3_live(slug, data)
                 else:
                     print(f"[REMINDER ONLY] Мало ліквідності ${series['volume']:,.0f}: {data['title']}")
 
@@ -720,9 +892,18 @@ async def check_active_matches():
                     await msg4a_sweep(slug, data)
 
                 # Split 1:1
-                if stage == "map2_done_split" and not state["notified_map2"]:
+                if stage in ["map2_done_split", "map3_live"] \
+                        and map2_result(data) == "split" \
+                        and not state["notified_map2"]:
                     state["notified_map2"] = True
                     await msg4b_split(slug, data)
+                    if data.get("map3"):
+                        state["notified_map3"] = True
+
+                # К3 з'явилась вже після повідомлення про split
+                if stage == "map3_live" and data.get("map3") and not state.get("notified_map3"):
+                    state["notified_map3"] = True
+                    await msg4c_map3_live(slug, data)
 
                 # Фінал після К3
                 if stage == "finished" and not state["notified_final"]:
