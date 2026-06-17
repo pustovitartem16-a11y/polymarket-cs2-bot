@@ -3,14 +3,15 @@ import json
 import re
 import httpx
 import os
-from datetime import datetime, timezone, date, timedelta
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 GAMMA_API = "https://gamma-api.polymarket.com"
 POLYMARKET_URL = "https://polymarket.com/sports/esports"
 
-KYIV_TZ = timezone(timedelta(hours=3))  # UTC+3
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 BAND_SHIFTS = {
     (50, 55): {"fav_win": 22, "dog_win": -24, "revert": 52},
@@ -25,6 +26,9 @@ BAND_SHIFTS = {
 
 MIN_SERIES_LIQUIDITY = 30_000
 MIN_MAP_LIQUIDITY = 3_000
+MAP_DONE_PRICE = 99.5
+SERIES_DONE_PRICE = 99.5
+STARTED_TOO_LONG_AGO_HOURS = 12
 
 match_states = {}
 notified_slugs = set()
@@ -51,6 +55,20 @@ def seconds_until_start(start_date_str):
         return 0
 
 
+def parse_iso_datetime(utc_str):
+    if not utc_str:
+        return None
+    try:
+        return datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def has_started(start_date_str):
+    dt = parse_iso_datetime(start_date_str)
+    return not dt or dt <= datetime.now(timezone.utc)
+
+
 def is_relevant_match(event):
     """
     Перевіряє чи матч актуальний:
@@ -65,11 +83,13 @@ def is_relevant_match(event):
         return True  # Немає дати — пропускаємо перевірку
 
     try:
-        dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+        dt = parse_iso_datetime(start_str)
+        if not dt:
+            return True
         now_utc = datetime.now(timezone.utc)
-        # Пропускаємо матчі що почались більше 12 годин тому
+        # Пропускаємо матчі що почались занадто давно
         hours_ago = (now_utc - dt).total_seconds() / 3600
-        if hours_ago > 12:
+        if hours_ago > STARTED_TOO_LONG_AGO_HOURS:
             return False
     except Exception:
         pass
@@ -97,10 +117,17 @@ async def send_telegram(text):
         print(f"Помилка відправки: {e}")
 
 
+async def get_json(client, url, **kwargs):
+    r = await client.get(url, **kwargs)
+    r.raise_for_status()
+    return r.json()
+
+
 async def get_cs2_slugs_from_page():
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.get(POLYMARKET_URL, headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
             all_slugs = re.findall(r'cs2-[a-z0-9-]+', r.text)
             seen = set()
             result = []
@@ -120,13 +147,51 @@ async def get_cs2_slugs_from_page():
 async def get_event_by_slug(slug):
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(f"{GAMMA_API}/events", params={"slug": slug, "limit": 1})
-            data = r.json()
+            data = await get_json(c, f"{GAMMA_API}/events", params={"slug": slug, "limit": 1})
             if data and isinstance(data, list):
                 return data[0]
     except Exception as e:
         print(f"Помилка get_event({slug}): {e}")
     return None
+
+
+def is_market_resolved(market):
+    return bool(
+        market.get("closed")
+        or market.get("resolved")
+        or market.get("archived")
+        or market.get("resolutionStatus")
+        or market.get("resolvedBy")
+    )
+
+
+def resolved_winner(outcomes, prices, market, threshold):
+    if len(outcomes) < 2 or len(prices) < 2:
+        return None
+
+    winner_from_api = (
+        market.get("winner")
+        or market.get("winningOutcome")
+        or market.get("resolvedOutcome")
+        or market.get("outcome")
+    )
+    if winner_from_api in outcomes:
+        return winner_from_api
+
+    if not is_market_resolved(market) and max(prices) * 100 < threshold:
+        return None
+
+    if prices[0] > prices[1] and prices[0] * 100 >= threshold:
+        return outcomes[0]
+    if prices[1] > prices[0] and prices[1] * 100 >= threshold:
+        return outcomes[1]
+    return None
+
+
+def is_live_market(market_data):
+    if not market_data or market_data.get("winner"):
+        return False
+    return 5 < market_data["price1"] < 95 and 5 < market_data["price2"] < 95
 
 
 def parse_markets(event):
@@ -149,13 +214,16 @@ def parse_markets(event):
             continue
         if len(ol) < 2 or len(pf) < 2:
             continue
+        is_series_market = ("series" in question or "moneyline" in question or "winner" in question) and "map" not in question
+        done_threshold = SERIES_DONE_PRICE if is_series_market else MAP_DONE_PRICE
         md = {
             "team1": ol[0], "team2": ol[1],
             "price1": round(pf[0] * 100), "price2": round(pf[1] * 100),
             "volume": volume,
-            "winner": ol[0] if pf[0] >= 0.95 else (ol[1] if pf[1] >= 0.95 else None),
+            "winner": resolved_winner(ol, pf, m, done_threshold),
+            "resolved": is_market_resolved(m),
         }
-        if ("series" in question or "moneyline" in question or "winner" in question) and "map" not in question:
+        if is_series_market:
             result["series"] = md
         elif "map 1" in question or "map1" in question:
             result["map1"] = md
@@ -173,26 +241,34 @@ def get_match_stage(data):
     map3 = data.get("map3")
     if not series:
         return "unknown"
-    s1, s2 = series["price1"], series["price2"]
-    if s1 >= 98 or s2 >= 98:
+
+    if map3 and map3.get("winner"):
         return "finished"
-    if map3:
-        if map3["price1"] >= 95 or map3["price2"] >= 95:
-            return "finished"
-        return "map3_live"
-    if map2:
-        p1, p2 = map2["price1"], map2["price2"]
-        if p1 >= 95 or p2 >= 95:
-            return "map2_done_sweep" if (s1 >= 90 or s2 >= 90) else "map2_done_split"
-        if 5 < p1 < 95 and 5 < p2 < 95:
+
+    map1_winner = map1.get("winner") if map1 else None
+    map2_winner = map2.get("winner") if map2 else None
+
+    if map2_winner:
+        if map1_winner and map1_winner == map2_winner:
+            return "map2_done_sweep"
+        if map1_winner and map1_winner != map2_winner:
+            return "map2_done_split"
+        return "map2_done_sweep" if max(series["price1"], series["price2"]) >= 90 else "map2_done_split"
+
+    if series.get("winner"):
+        return "finished"
+
+    if map1_winner:
+        if is_live_market(map2):
             return "map2_live"
         return "map1_done"
-    if map1:
-        p1, p2 = map1["price1"], map1["price2"]
-        if p1 >= 95 or p2 >= 95:
-            return "map1_done"
-        if 5 < p1 < 95 and 5 < p2 < 95:
-            return "map1_live"
+
+    if not has_started(data.get("start_date", "")):
+        return "before"
+
+    if is_live_market(map1):
+        return "map1_live"
+
     return "before"
 
 
@@ -271,11 +347,15 @@ async def msg2_reminder(slug):
 
 
 async def schedule_reminder(slug, start_date_str):
+    if not start_date_str:
+        return
     secs = seconds_until_start(start_date_str)
     delay = secs - 30 * 60
     if delay > 0:
         await asyncio.sleep(delay)
-    if match_states.get(slug, {}).get("stage") in ["before", "map1_live"]:
+    state = match_states.get(slug, {})
+    if state.get("stage") in ["before", "map1_live"] and not state.get("notified_reminder"):
+        state["notified_reminder"] = True
         await msg2_reminder(slug)
 
 
@@ -291,8 +371,6 @@ async def msg3_map1_done(slug, data):
         return
 
     winner_k1 = map1.get("winner") if map1 else None
-    if not winner_k1 and map1:
-        winner_k1 = map1["team1"] if map1["price1"] >= 95 else map1["team2"]
     match_states[slug]["map1_winner"] = winner_k1
 
     cur_fav, cur_fav_p = (series["team1"], series["price1"]) if series["price1"] >= series["price2"] else (series["team2"], series["price2"])
@@ -356,7 +434,7 @@ async def msg4a_sweep(slug, data):
     title = data.get("title", slug)
     if not series:
         return
-    winner = series["team1"] if series["price1"] >= 95 else series["team2"]
+    winner = series.get("winner") or (series["team1"] if series["price1"] > series["price2"] else series["team2"])
     await send_telegram(
         f"🏆 <b>СЕРІЯ ЗАКІНЧИЛАСЬ! 2:0 SWEEP</b>\n"
         f"⚔️ <b>{title}</b>\n"
@@ -380,7 +458,7 @@ async def msg4b_split(slug, data):
 
     map2_winner = None
     if map2:
-        map2_winner = map2.get("winner") or (map2["team1"] if map2["price1"] >= 95 else map2["team2"])
+        map2_winner = map2.get("winner")
 
     msg = f"""⚖️ <b>К2 ЗАКІНЧИЛАСЬ! РАХУНОК 1:1</b>
 ⚔️ <b>{title}</b>
@@ -415,7 +493,7 @@ async def msg5_final(slug, data):
     title = data.get("title", slug)
     if not series:
         return
-    winner = series["team1"] if series["price1"] >= 95 else series["team2"]
+    winner = series.get("winner") or (series["team1"] if series["price1"] > series["price2"] else series["team2"])
     await send_telegram(
         f"🏁 <b>СЕРІЯ ЗАВЕРШЕНА (К3)</b>\n"
         f"⚔️ <b>{title}</b>\n"
@@ -469,6 +547,7 @@ async def scan_matches():
                     "stage": stage,
                     "map1_winner": None,
                     "notified_map1": False,
+                    "notified_reminder": False,
                     "notified_map2": False,
                     "notified_final": False,
                     "was_sweep": False,
@@ -485,7 +564,8 @@ async def scan_matches():
                             schedule_reminder(slug, data.get("start_date", ""))
                         )
                         reminder_tasks[slug] = task
-                    elif stage == "map1_live":
+                    elif stage == "map1_live" and not match_states[slug]["notified_reminder"]:
+                        match_states[slug]["notified_reminder"] = True
                         await msg2_reminder(slug)
                 else:
                     print(f"[SKIP] Мало ліквідності ${series['volume']:,.0f}: {data['title']}")
@@ -530,21 +610,21 @@ async def check_active_matches():
                     await msg3_map1_done(slug, data)
 
                 # Sweep 2:0
-                elif stage == "map2_done_sweep" and not state["notified_map2"]:
+                if stage == "map2_done_sweep" and not state["notified_map2"]:
                     state["notified_map2"] = True
                     state["notified_final"] = True
                     state["was_sweep"] = True
                     await msg4a_sweep(slug, data)
 
                 # Split 1:1
-                elif stage == "map2_done_split" and not state["notified_map2"]:
+                if stage == "map2_done_split" and not state["notified_map2"]:
                     state["notified_map2"] = True
                     await msg4b_split(slug, data)
 
                 # Фінал після К3
-                elif stage == "finished" and not state["notified_final"]:
+                if stage == "finished" and not state["notified_final"]:
                     state["notified_final"] = True
-                    if state.get("notified_map2") and not state.get("was_sweep"):
+                    if not state.get("was_sweep"):
                         await msg5_final(slug, data)
 
         except Exception as e:
