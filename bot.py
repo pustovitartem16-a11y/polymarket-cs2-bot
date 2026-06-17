@@ -401,7 +401,7 @@ async def msg2_reminder(slug):
     series = data.get("series")
     map1 = data.get("map1")
     title = data.get("title", slug)
-    if not series or series["volume"] < MIN_SERIES_LIQUIDITY:
+    if not series:
         return
 
     fav_price = max(series["price1"], series["price2"])
@@ -642,21 +642,19 @@ async def scan_matches():
                 }
                 notified_slugs.add(slug)
 
-                # Повідомлення 1 — тільки якщо достатньо ліквідності
+                if stage == "before":
+                    task = asyncio.create_task(
+                        schedule_reminder(slug, data.get("start_date", ""))
+                    )
+                    reminder_tasks[slug] = task
+                elif stage == "map1_live" and not match_states[slug]["notified_reminder"]:
+                    match_states[slug]["notified_reminder"] = True
+                    await msg2_reminder(slug)
+
                 if series["volume"] >= MIN_SERIES_LIQUIDITY:
                     await msg1_match_found(slug, data)
-
-                    # Планування нагадування за 30 хв
-                    if stage == "before":
-                        task = asyncio.create_task(
-                            schedule_reminder(slug, data.get("start_date", ""))
-                        )
-                        reminder_tasks[slug] = task
-                    elif stage == "map1_live" and not match_states[slug]["notified_reminder"]:
-                        match_states[slug]["notified_reminder"] = True
-                        await msg2_reminder(slug)
                 else:
-                    print(f"[SKIP] Мало ліквідності ${series['volume']:,.0f}: {data['title']}")
+                    print(f"[REMINDER ONLY] Мало ліквідності ${series['volume']:,.0f}: {data['title']}")
 
         except Exception as e:
             print(f"Помилка scan: {e}")
