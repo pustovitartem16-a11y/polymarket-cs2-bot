@@ -1,13 +1,14 @@
 import asyncio
 import json
-import websockets
+import re
 import httpx
 import os
+from datetime import datetime, timezone, date
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
-WS_URL = "wss://sports-api.polymarket.com/ws"
 GAMMA_API = "https://gamma-api.polymarket.com"
+POLYMARKET_URL = "https://polymarket.com/sports/esports"
 
 BAND_SHIFTS = {
     (50, 55): {"fav_win": 22, "dog_win": -24, "revert": 52},
@@ -21,7 +22,11 @@ BAND_SHIFTS = {
 }
 
 MIN_SERIES_LIQUIDITY = 30_000
+
+# Храним состояния матчей
 match_states = {}
+# Уже отправленные превью
+notified_slugs = set()
 
 
 def get_band(fav_price):
@@ -44,25 +49,47 @@ async def send_telegram(text):
         print(f"Ошибка отправки: {e}")
 
 
-async def get_event_data(home, away):
+async def get_cs2_slugs_from_page():
+    """Парсит страницу Polymarket и возвращает уникальные CS2 slugs сегодняшнего дня"""
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            for search in [home, away]:
-                r = await client.get(f"{GAMMA_API}/events", params={
-                    "search": search,
-                    "active": "true",
-                    "limit": 10,
-                })
-                events = r.json()
-                if not isinstance(events, list):
-                    continue
-                for event in events:
-                    title = event.get("title", "").lower()
-                    if (home.lower()[:4] in title or home.lower() in title) and \
-                       (away.lower()[:4] in title or away.lower() in title):
-                        return parse_markets(event)
+        today = date.today().strftime("%Y-%m-%d")
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(
+                POLYMARKET_URL,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"}
+            )
+            # Ищем все cs2 slugs
+            all_slugs = re.findall(r'cs2-[a-z0-9-]+', r.text)
+            # Фильтруем уникальные и только основные матчи (без game1/game2/handicap/total)
+            seen = set()
+            result = []
+            for slug in all_slugs:
+                # Берём только основные slugs матчей (формат: cs2-team1-team2-date)
+                # Исключаем подрынки (game1, game2, round, handicap, total)
+                parts = slug.split("-")
+                # Основной slug содержит дату в конце (2026-06-17)
+                if len(parts) >= 5 and parts[-3].isdigit() and parts[-2].isdigit() and parts[-1].isdigit():
+                    # Это основной slug матча
+                    match_date = f"{parts[-3]}-{parts[-2]}-{parts[-1]}"
+                    if match_date == today and slug not in seen:
+                        seen.add(slug)
+                        result.append(slug)
+            return result
     except Exception as e:
-        print(f"Ошибка get_event_data({home} vs {away}): {e}")
+        print(f"Ошибка парсинга страницы: {e}")
+        return []
+
+
+async def get_event_by_slug(slug):
+    """Достаёт данные матча по slug"""
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{GAMMA_API}/events", params={"slug": slug, "limit": 1})
+            data = r.json()
+            if data and isinstance(data, list):
+                return data[0]
+    except Exception as e:
+        print(f"Ошибка get_event_by_slug({slug}): {e}")
     return None
 
 
@@ -70,6 +97,7 @@ def parse_markets(event):
     markets = event.get("markets", [])
     result = {
         "title": event.get("title", ""),
+        "start_date": event.get("startDate", ""),
         "series": None,
         "map1": None,
         "map2": None,
@@ -106,24 +134,21 @@ def parse_markets(event):
     return result
 
 
-async def send_preview(home, away):
-    data = await get_event_data(home, away)
-
-    if not data or not data.get("series"):
-        await send_telegram(
-            f"📋 <b>НОВЫЙ МАТЧ</b>\n"
-            f"⚔️ <b>{home} vs {away}</b>\n\n"
-            f"⚠️ Данные на Polymarket не найдены — проверь вручную"
-        )
-        return
-
-    series = data["series"]
+async def send_preview(slug, data):
+    """Отправляет превью матча"""
+    series = data.get("series")
     map1 = data.get("map1")
+    title = data.get("title", slug)
+    start = data.get("start_date", "")[:16].replace("T", " ")
+
+    if not series:
+        return
 
     if series["volume"] < MIN_SERIES_LIQUIDITY:
         await send_telegram(
             f"📋 <b>НОВЫЙ МАТЧ</b>\n"
-            f"⚔️ <b>{home} vs {away}</b>\n"
+            f"⚔️ <b>{title}</b>\n"
+            f"🕐 Начало: {start}\n"
             f"⚠️ Мало ликвидности (${series['volume']:,.0f}) — пропускаем"
         )
         return
@@ -135,8 +160,9 @@ async def send_preview(home, away):
     liq_icon = "✅" if liq_ok else "⚠️"
     verdict = "Кандидат для торговли" if liq_ok else "Пропустить"
 
-    msg = f"""📋 <b>НОВЫЙ МАТЧ ОБНАРУЖЕН</b>
-⚔️ <b>{home} vs {away}</b>
+    msg = f"""📋 <b>CS2 МАТЧ ОБНАРУЖЕН</b>
+⚔️ <b>{title}</b>
+🕐 Начало: {start}
 
 📊 <b>Серия:</b> {series['team1']} {series['price1']}¢ / {series['team2']} {series['price2']}¢
 💧 Объём серии: ${series['volume']:,.0f}"""
@@ -155,254 +181,131 @@ async def send_preview(home, away):
 
     msg += f"\n\n{liq_icon} <b>Вердикт:</b> {verdict}"
     await send_telegram(msg)
-    print(f"[ПРЕВЬЮ] {home} vs {away}")
+    print(f"[ПРЕВЬЮ] {title}")
 
 
-async def send_start_reminder(home, away):
-    data = await get_event_data(home, away)
-    series = data.get("series") if data else None
+async def scan_matches():
+    """Каждые 2 минуты сканирует страницу и отправляет превью новых матчей"""
+    while True:
+        try:
+            slugs = await get_cs2_slugs_from_page()
+            print(f"Найдено CS2 slugs: {slugs}")
 
-    if series and series["volume"] >= MIN_SERIES_LIQUIDITY:
-        fav_price = max(series["price1"], series["price2"])
-        band_range, _ = get_band(fav_price)
-        band_str = f"{band_range[0]}-{band_range[1]}%" if band_range else "—"
-        msg = f"""⚡️ <b>МАТЧ НАЧИНАЕТСЯ!</b>
-⚔️ <b>{home} vs {away}</b>
+            for slug in slugs:
+                if slug in notified_slugs:
+                    continue
 
-📊 Серия: {series['team1']} {series['price1']}¢ / {series['team2']} {series['price2']}¢
-💧 Объём: ${series['volume']:,.0f}
-📉 Диапазон: {band_str}
+                event = await get_event_by_slug(slug)
+                if not event:
+                    # Попробуем через search
+                    continue
 
-👁 Следи за К1!"""
-    else:
-        msg = f"""⚡️ <b>МАТЧ НАЧИНАЕТСЯ!</b>
-⚔️ <b>{home} vs {away}</b>
-👁 Следи за К1!"""
+                data = parse_markets(event)
+                if data.get("series"):
+                    notified_slugs.add(slug)
+                    await send_preview(slug, data)
 
-    await send_telegram(msg)
-    print(f"[СТАРТ] {home} vs {away}")
+                    # Сохраняем в match_states для отслеживания К1/К2
+                    if slug not in match_states:
+                        match_states[slug] = {
+                            "title": data["title"],
+                            "map1_done": False,
+                            "map2_done": False,
+                            "final_done": False,
+                            "map1_winner": None,
+                        }
+
+        except Exception as e:
+            print(f"Ошибка scan_matches: {e}")
+
+        await asyncio.sleep(120)  # Каждые 2 минуты
 
 
-async def handle_map1_end(slug, score, home, away):
-    data = await get_event_data(home, away)
-    series = data.get("series") if data else None
-    map2 = data.get("map2") if data else None
-    title = (data.get("title") if data else None) or f"{home} vs {away}"
+async def check_active_matches():
+    """Каждые 3 минуты проверяет активные матчи на смену карт"""
+    while True:
+        await asyncio.sleep(180)
+        try:
+            for slug, state in list(match_states.items()):
+                if state.get("final_done"):
+                    continue
 
-    try:
-        parts = score.split("|")
-        home_maps, away_maps = parts[1].split("-")
-        winner_is_home = int(home_maps) > int(away_maps)
-    except Exception:
-        winner_is_home = True
+                event = await get_event_by_slug(slug)
+                if not event:
+                    continue
 
-    winner = home if winner_is_home else away
-    match_states[slug]["map1_winner_home"] = winner_is_home
+                data = parse_markets(event)
+                series = data.get("series")
+                map2 = data.get("map2")
+                map3 = data.get("map3")
+                title = state.get("title", slug)
 
-    if not series or series["volume"] < MIN_SERIES_LIQUIDITY:
-        await send_telegram(
-            f"ℹ️ <b>К1 закончилась:</b> {home} vs {away}\n"
-            f"🏆 К1 взял: <b>{winner}</b>\n"
-            f"⚠️ Мало ликвидности — пропускаем"
-        )
-        return
+                if not series:
+                    continue
 
-    fav_price = max(series["price1"], series["price2"])
-    if series["price1"] >= series["price2"]:
-        cur_fav, cur_fav_p = series["team1"], series["price1"]
-        cur_dog, cur_dog_p = series["team2"], series["price2"]
-    else:
-        cur_fav, cur_fav_p = series["team2"], series["price2"]
-        cur_dog, cur_dog_p = series["team1"], series["price1"]
+                # Определяем текущее состояние по рынкам
+                # Если К2 рынок открыт и К1 уже закрыта
+                map1 = data.get("map1")
 
-    band_range, band_data = get_band(cur_fav_p)
-    revert = band_data["revert"] if band_data else "~50"
+                # Проверяем закрылась ли К1 (map1 market closed или цена 0/100)
+                if map1 and not state["map1_done"]:
+                    p1 = map1["price1"]
+                    p2 = map1["price2"]
+                    if p1 >= 95 or p2 >= 95:  # Карта почти завершена
+                        state["map1_done"] = True
+                        winner = map1["team1"] if p1 >= 95 else map1["team2"]
+                        state["map1_winner"] = winner
 
-    msg = f"""🎮 <b>К1 ЗАКОНЧИЛАСЬ!</b>
+                        fav_price = max(series["price1"], series["price2"])
+                        if series["price1"] >= series["price2"]:
+                            cur_fav, cur_fav_p = series["team1"], series["price1"]
+                            cur_dog, cur_dog_p = series["team2"], series["price2"]
+                        else:
+                            cur_fav, cur_fav_p = series["team2"], series["price2"]
+                            cur_dog, cur_dog_p = series["team1"], series["price1"]
+
+                        band_range, band_data = get_band(cur_fav_p)
+                        revert = band_data["revert"] if band_data else "~50"
+
+                        msg = f"""🎮 <b>К1 ЗАКОНЧИЛАСЬ!</b>
 ⚔️ <b>{title}</b>
-🏆 Взял К1: <b>{winner}</b> | Счёт: {score}
+🏆 К1 взял: <b>{winner}</b>
 
 📈 <b>Серия сейчас:</b>
   {cur_fav} {cur_fav_p}¢ / {cur_dog} {cur_dog_p}¢
   Объём: ${series['volume']:,.0f}"""
 
-    if map2:
-        msg += f"""
-
+                        if map2:
+                            msg += f"""
 🗺 <b>К2:</b>
-  {map2['team1']} {map2['price1']}¢ / {map2['team2']} {map2['price2']}¢
-  Объём: ${map2['volume']:,.0f}"""
+  {map2['team1']} {map2['price1']}¢ / {map2['team2']} {map2['price2']}¢"""
 
-    if band_data:
-        msg += f"""
+                        if band_data:
+                            msg += f"""
 
 🤖 <b>Прогноз (база {band_range[0]}-{band_range[1]}%):</b>
   При 1:1 серия {cur_fav} → ~{revert}¢"""
 
-    msg += "\n\n⚡️ <b>У тебя ~5 минут — открывай калькулятор!</b>"
-    await send_telegram(msg)
-    print(f"[К1] {home} vs {away}: {winner}")
+                        msg += "\n\n⚡️ <b>У тебя ~5 минут — открывай калькулятор!</b>"
+                        await send_telegram(msg)
+                        print(f"[К1] {title}: {winner}")
 
+                # Проверяем завершение серии
+                s1 = series["price1"]
+                s2 = series["price2"]
+                if (s1 >= 98 or s2 >= 98) and not state["final_done"]:
+                    state["final_done"] = True
+                    winner = series["team1"] if s1 >= 98 else series["team2"]
+                    await send_telegram(
+                        f"🏆 <b>СЕРИЯ ЗАВЕРШЕНА!</b>\n"
+                        f"⚔️ <b>{title}</b>\n"
+                        f"🥇 Победитель: <b>{winner}</b>\n\n"
+                        f"✅ Серия нога резолвится автоматически"
+                    )
+                    print(f"[ФИНАЛ] {title}: {winner}")
 
-async def handle_map2_end(slug, score, home, away):
-    data = await get_event_data(home, away)
-    series = data.get("series") if data else None
-    map3 = data.get("map3") if data else None
-    title = (data.get("title") if data else None) or f"{home} vs {away}"
-
-    if not series or series["volume"] < MIN_SERIES_LIQUIDITY:
-        return
-
-    try:
-        parts = score.split("|")
-        home_maps, away_maps = parts[1].split("-")
-        home_maps, away_maps = int(home_maps), int(away_maps)
-    except Exception:
-        return
-
-    if home_maps == 2 or away_maps == 2:
-        winner = home if home_maps == 2 else away
-        msg = f"""🏆 <b>СЕРИЯ ЗАКОНЧИЛАСЬ! 2:0 SWEEP</b>
-⚔️ <b>{title}</b>
-🥇 Победитель: <b>{winner}</b>
-
-✅ Обе ноги резолвятся автоматически
-💰 Профит зачислится на счёт Polymarket"""
-
-    elif home_maps == 1 and away_maps == 1:
-        map1_winner_home = match_states.get(slug, {}).get("map1_winner_home")
-        if map1_winner_home is True:
-            map2_winner = away
-        elif map1_winner_home is False:
-            map2_winner = home
-        else:
-            map2_winner = "неизвестно"
-
-        msg = f"""⚖️ <b>К2 ЗАКОНЧИЛАСЬ! СЧЁТ 1:1</b>
-⚔️ <b>{title}</b>
-🗺 К2 взял: <b>{map2_winner}</b>
-
-📈 <b>Серия сейчас:</b>
-  {series['team1']} {series['price1']}¢ / {series['team2']} {series['price2']}¢"""
-
-        if map3:
-            msg += f"""
-🗺 <b>К3:</b>
-  {map3['team1']} {map3['price1']}¢ / {map3['team2']} {map3['price2']}¢"""
-
-        msg += f"""
-
-✅ <b>Что делать:</b>
-Нога «К2» резолвится в 100¢ → профит зафиксирован
-<b>Продай ногу «СЕРИЯ»</b> по текущей цене прямо сейчас!
-Не жди К3 — фиксируй гарантированный профит
-
-⚡️ Открывай Polymarket и продавай серию ногу!"""
-    else:
-        return
-
-    await send_telegram(msg)
-    print(f"[К2] {home} vs {away}: {home_maps}:{away_maps}")
-
-
-async def handle_series_end(slug, score, home, away):
-    try:
-        parts = score.split("|")
-        home_maps, away_maps = parts[1].split("-")
-        home_maps, away_maps = int(home_maps), int(away_maps)
-        if home_maps + away_maps < 3:
-            return
-        winner = home if home_maps > away_maps else away
-    except Exception:
-        return
-
-    await send_telegram(
-        f"🏁 <b>СЕРИЯ ЗАВЕРШЕНА (К3)</b>\n"
-        f"⚔️ <b>{home} vs {away}</b>\n"
-        f"🥇 Победитель: <b>{winner}</b>\n"
-        f"📊 Счёт карт: {home_maps}:{away_maps}\n\n"
-        f"✅ Серия нога резолвится автоматически"
-    )
-    print(f"[К3] {home} vs {away}: {winner}")
-
-
-async def handle_ws_message(data):
-    if data.get("leagueAbbreviation") != "cs2":
-        return
-
-    slug = data.get("slug", "")
-    period = data.get("period", "")
-    status = data.get("status", "")
-    score = data.get("score", "")
-    home = data.get("homeTeam", "")
-    away = data.get("awayTeam", "")
-
-    if not slug or not home or not away:
-        return
-
-    # Инициализируем состояние при первом появлении
-    if slug not in match_states:
-        match_states[slug] = {
-            "period": None,
-            "status": None,
-            "notified_preview": False,
-            "notified_start": False,
-            "notified_map1": False,
-            "notified_map2": False,
-            "notified_final": False,
-            "map1_winner_home": None,
-        }
-
-    prev_status = match_states[slug]["status"]
-    prev_period = match_states[slug]["period"]
-    match_states[slug]["status"] = status
-    match_states[slug]["period"] = period
-
-    # Превью — при любом первом появлении not_started
-    if status == "not_started" and not match_states[slug]["notified_preview"]:
-        match_states[slug]["notified_preview"] = True
-        asyncio.create_task(send_preview(home, away))
-
-    # Напоминание при старте
-    if status == "running" and prev_status != "running" and not match_states[slug]["notified_start"]:
-        match_states[slug]["notified_start"] = True
-        asyncio.create_task(send_start_reminder(home, away))
-
-    # К1 закончилась
-    if prev_period == "1/3" and period == "2/3":
-        if not match_states[slug]["notified_map1"]:
-            match_states[slug]["notified_map1"] = True
-            asyncio.create_task(handle_map1_end(slug, score, home, away))
-
-    # К2 закончилась
-    elif prev_period == "2/3" and period in ["3/3", "finished"]:
-        if not match_states[slug]["notified_map2"]:
-            match_states[slug]["notified_map2"] = True
-            asyncio.create_task(handle_map2_end(slug, score, home, away))
-
-    # Серия завершена
-    elif status == "finished" and not match_states[slug]["notified_final"]:
-        match_states[slug]["notified_final"] = True
-        asyncio.create_task(handle_series_end(slug, score, home, away))
-
-
-async def websocket_listener():
-    while True:
-        try:
-            async with websockets.connect(WS_URL, ping_interval=None) as ws:
-                print("WebSocket подключён")
-                async for message in ws:
-                    if message == "ping":
-                        await ws.send("pong")
-                        continue
-                    try:
-                        data = json.loads(message)
-                        await handle_ws_message(data)
-                    except json.JSONDecodeError:
-                        pass
         except Exception as e:
-            print(f"WebSocket ошибка: {e}, переподключение через 5с...")
-            await asyncio.sleep(5)
+            print(f"Ошибка check_active_matches: {e}")
 
 
 async def main():
@@ -410,13 +313,16 @@ async def main():
     await send_telegram(
         "✅ <b>Polymarket CS2 бот запущен!</b>\n\n"
         "Буду присылать:\n"
-        "• При появлении матча — превью\n"
-        "• При старте матча — напоминание\n"
+        "• Превью новых матчей (сканирование каждые 2 мин)\n"
         "• После К1 — цены и прогноз\n"
-        "• После К2 — что делать с позицией\n"
-        "• После К3 — итог серии"
+        "• После завершения серии — итог"
     )
-    await websocket_listener()
+
+    # Запускаем сканирование сразу
+    await asyncio.gather(
+        scan_matches(),
+        check_active_matches(),
+    )
 
 
 if __name__ == "__main__":
