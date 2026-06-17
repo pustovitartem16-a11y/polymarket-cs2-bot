@@ -9,7 +9,14 @@ from zoneinfo import ZoneInfo
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_API = "https://clob.polymarket.com"
 POLYMARKET_URL = "https://polymarket.com/sports/esports"
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
+    "Origin": "https://polymarket.com",
+    "Referer": "https://polymarket.com/",
+}
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
@@ -29,6 +36,7 @@ MIN_MAP_LIQUIDITY = 3_000
 MAP_DONE_PRICE = 99.5
 SERIES_DONE_PRICE = 99.5
 STARTED_TOO_LONG_AGO_HOURS = 12
+PRICE_SIDE = os.environ.get("POLYMARKET_PRICE_SIDE", "SELL").upper()
 
 match_states = {}
 notified_slugs = set()
@@ -55,6 +63,17 @@ def seconds_until_start(start_date_str):
         return 0
 
 
+def event_start_time(event):
+    return (
+        event.get("startTime")
+        or event.get("gameStartTime")
+        or event.get("scheduledStartTime")
+        or event.get("eventStartTime")
+        or event.get("startDate")
+        or ""
+    )
+
+
 def parse_iso_datetime(utc_str):
     if not utc_str:
         return None
@@ -78,7 +97,7 @@ def is_relevant_match(event):
     if event.get("closed") or event.get("archived"):
         return False
 
-    start_str = event.get("startDate", "")
+    start_str = event_start_time(event)
     if not start_str:
         return True  # Немає дати — пропускаємо перевірку
 
@@ -126,7 +145,7 @@ async def get_json(client, url, **kwargs):
 async def get_cs2_slugs_from_page():
     try:
         async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get(POLYMARKET_URL, headers={"User-Agent": "Mozilla/5.0"})
+            r = await c.get(POLYMARKET_URL, headers=HTTP_HEADERS)
             r.raise_for_status()
             all_slugs = re.findall(r'cs2-[a-z0-9-]+', r.text)
             seen = set()
@@ -147,12 +166,74 @@ async def get_cs2_slugs_from_page():
 async def get_event_by_slug(slug):
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            data = await get_json(c, f"{GAMMA_API}/events", params={"slug": slug, "limit": 1})
+            data = await get_json(c, f"{GAMMA_API}/events", params={"slug": slug, "limit": 1}, headers=HTTP_HEADERS)
             if data and isinstance(data, list):
                 return data[0]
     except Exception as e:
         print(f"Помилка get_event({slug}): {e}")
     return None
+
+
+def parse_json_list(value):
+    try:
+        return json.loads(value) if isinstance(value, str) else value
+    except Exception:
+        return []
+
+
+def cents(price):
+    value = float(price) * 100
+    if value < 10 or value > 90:
+        return round(value, 1)
+    return int(value + 0.5)
+
+
+async def apply_live_clob_prices(data):
+    markets = [data.get("series"), data.get("map1"), data.get("map2"), data.get("map3")]
+    token_to_market = {}
+    requests = []
+
+    for market in markets:
+        if not market:
+            continue
+        for index, token_id in enumerate(market.get("token_ids", [])[:2]):
+            if not token_id:
+                continue
+            token_to_market[token_id] = (market, index)
+            requests.append({"token_id": token_id, "side": PRICE_SIDE})
+
+    if not requests:
+        return data
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(f"{CLOB_API}/prices", json=requests, headers=HTTP_HEADERS)
+            r.raise_for_status()
+            prices = r.json()
+
+        for token_id, side_prices in prices.items():
+            price = side_prices.get(PRICE_SIDE)
+            if price is None or token_id not in token_to_market:
+                continue
+            market, index = token_to_market[token_id]
+            if index == 0:
+                market["price1"] = cents(price)
+            elif index == 1:
+                market["price2"] = cents(price)
+            market["price_source"] = f"clob:{PRICE_SIDE}"
+    except Exception as e:
+        print(f"Помилка CLOB prices: {e}")
+
+    return data
+
+
+async def get_parsed_event(slug):
+    event = await get_event_by_slug(slug)
+    if not event:
+        return None, None
+    data = parse_markets(event)
+    await apply_live_clob_prices(data)
+    return event, data
 
 
 def is_market_resolved(market):
@@ -198,38 +279,47 @@ def parse_markets(event):
     markets = event.get("markets", [])
     result = {
         "title": event.get("title", ""),
-        "start_date": event.get("startDate", ""),
+        "start_date": event_start_time(event),
         "series": None, "map1": None, "map2": None, "map3": None,
     }
     for m in markets:
         question = m.get("question", "").lower()
+        market_type = (m.get("sportsMarketType") or "").lower()
+        group_title = (m.get("groupItemTitle") or "").lower()
         volume = float(m.get("volumeNum", 0) or 0)
         outcomes = m.get("outcomes", "[]")
         prices_str = m.get("outcomePrices", "[]")
+        token_ids = parse_json_list(m.get("clobTokenIds", "[]"))
         try:
-            ol = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
-            pl = json.loads(prices_str) if isinstance(prices_str, str) else prices_str
+            ol = parse_json_list(outcomes)
+            pl = parse_json_list(prices_str)
             pf = [float(p) for p in pl]
         except Exception:
             continue
         if len(ol) < 2 or len(pf) < 2:
             continue
-        is_series_market = ("series" in question or "moneyline" in question or "winner" in question) and "map" not in question
+        is_series_market = (
+            market_type == "moneyline"
+            or group_title == "match winner"
+            or (("series" in question or "moneyline" in question) and "map" not in question)
+        )
         done_threshold = SERIES_DONE_PRICE if is_series_market else MAP_DONE_PRICE
         md = {
             "team1": ol[0], "team2": ol[1],
-            "price1": round(pf[0] * 100), "price2": round(pf[1] * 100),
+            "price1": cents(pf[0]), "price2": cents(pf[1]),
             "volume": volume,
             "winner": resolved_winner(ol, pf, m, done_threshold),
             "resolved": is_market_resolved(m),
+            "token_ids": token_ids,
+            "price_source": "gamma",
         }
         if is_series_market:
             result["series"] = md
-        elif "map 1" in question or "map1" in question:
+        elif group_title == "map 1 winner" or "map 1 winner" in question or "map1 winner" in question:
             result["map1"] = md
-        elif "map 2" in question or "map2" in question:
+        elif group_title == "map 2 winner" or "map 2 winner" in question or "map2 winner" in question:
             result["map2"] = md
-        elif "map 3" in question or "map3" in question:
+        elif group_title == "map 3 winner" or "map 3 winner" in question or "map3 winner" in question:
             result["map3"] = md
     return result
 
@@ -305,10 +395,9 @@ async def msg1_match_found(slug, data):
 # ПОВІДОМЛЕННЯ 2 — Нагадування за 30 хвилин
 # ============================================================
 async def msg2_reminder(slug):
-    event = await get_event_by_slug(slug)
+    event, data = await get_parsed_event(slug)
     if not event:
         return
-    data = parse_markets(event)
     series = data.get("series")
     map1 = data.get("map1")
     title = data.get("title", slug)
@@ -518,7 +607,7 @@ async def scan_matches():
                 if slug in notified_slugs:
                     continue
 
-                event = await get_event_by_slug(slug)
+                event, data = await get_parsed_event(slug)
                 if not event:
                     continue
 
@@ -528,7 +617,6 @@ async def scan_matches():
                     print(f"[SKIP] Старий або закритий: {slug}")
                     continue
 
-                data = parse_markets(event)
                 series = data.get("series")
                 if not series:
                     continue
@@ -588,11 +676,10 @@ async def check_active_matches():
                 if state.get("notified_final"):
                     continue
 
-                event = await get_event_by_slug(slug)
+                event, data = await get_parsed_event(slug)
                 if not event:
                     continue
 
-                data = parse_markets(event)
                 series = data.get("series")
                 if not series or series["volume"] < MIN_SERIES_LIQUIDITY:
                     continue
