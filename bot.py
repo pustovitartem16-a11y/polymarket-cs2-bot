@@ -386,19 +386,9 @@ def forecast_split_prices(series, map1_winner, split_winner, state):
 
 def verdict_details(series, map1, band_range):
     reasons = []
-    if not band_range:
-        reasons.append("немає робочого діапазону фаворита")
-    elif band_range[0] > 70:
-        reasons.append(f"фаворит {band_range[0]}-{band_range[1]}% вище робочої зони")
-
     if not series or series["volume"] < MIN_SERIES_LIQUIDITY:
         volume = series["volume"] if series else 0
         reasons.append(f"об'єм серії ${volume:,.0f} < ${MIN_SERIES_LIQUIDITY:,.0f}")
-
-    if not map1:
-        reasons.append("К1 Winner market не знайдено")
-    elif map1["volume"] < MIN_MAP_LIQUIDITY:
-        reasons.append(f"об'єм К1 ${map1['volume']:,.0f} < ${MIN_MAP_LIQUIDITY:,.0f}")
 
     return not reasons, reasons
 
@@ -520,7 +510,7 @@ async def msg1_match_found(slug, data):
     band_range, _ = get_band(fav_price)
     liq_ok, reasons = verdict_details(series, map1, band_range)
     verdict_icon = "✅" if liq_ok else "⚠️"
-    verdict = "Кандидат для спостереження" if liq_ok else "Не кандидат"
+    verdict = "Кандидат по об'єму серії" if liq_ok else "Не кандидат"
     details = "" if liq_ok else "\nПричини: " + "; ".join(reasons)
 
     msg = f"""🔍 <b>ЗНАЙДЕНО CS2 МАТЧ</b>
@@ -570,7 +560,7 @@ async def msg2_reminder(slug):
         msg += f"\n{map_lines}"
 
     if liq_ok:
-        msg += "\n\n✅ <b>Вердикт:</b> Кандидат — чекаємо завершення К1"
+        msg += "\n\n✅ <b>Вердикт:</b> Кандидат по об'єму серії — чекаємо завершення К1"
     else:
         msg += "\n\n⚠️ <b>Вердикт:</b> Не кандидат"
         msg += "\nПричини: " + "; ".join(reasons)
