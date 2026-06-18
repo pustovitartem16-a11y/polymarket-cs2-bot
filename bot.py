@@ -120,6 +120,9 @@ def get_band(fav_price):
     for (lo, hi), data in BAND_SHIFTS.items():
         if lo <= fav_price < hi:
             return (lo, hi), data
+    top_band = max(BAND_SHIFTS.keys(), key=lambda band: band[1])
+    if fav_price >= top_band[1]:
+        return top_band, BAND_SHIFTS[top_band]
     return None, None
 
 
@@ -353,7 +356,7 @@ def forecast_split_prices(series, map1_winner, split_winner, state):
 
     prematch_fav = state.get("prematch_fav")
     prematch_fav_price = state.get("prematch_fav_price")
-    if not prematch_fav or not prematch_fav_price or state.get("prematch_source") != "before":
+    if not prematch_fav or not prematch_fav_price:
         return None
 
     _, band_data = get_band(prematch_fav_price)
@@ -633,13 +636,13 @@ async def msg3_map1_done(slug, data):
         fav_forecast = split_forecast.get(prematch_fav) if split_forecast else None
         band_text = f"{band_range[0]}-{band_range[1]}%" if band_range else "поза базою"
 
-        source_note = "" if prematch_reliable else "\n  ⚠️ Прематчева база не зафіксована ботом — прогноз вручну звірити в базі."
+        source_note = "" if prematch_reliable else "\n  ⚠️ Прематчева база не зафіксована ботом — використовую live-ціну як наближення."
         msg += f"""
 
 🤖 Прогноз (база {band_text}, фаворит: {prematch_fav} {prematch_fav_price}¢):"""
         if split_forecast and fav_forecast is not None:
             delta = split_forecast.get("delta")
-            delta_text = f" ({delta:+g}¢ від прематчу)" if delta is not None else ""
+            delta_text = f" ({delta:+g}¢ від бази)" if delta is not None else ""
             msg += f"""
   При 1:1 серія {prematch_fav} → ~{fav_forecast}¢{delta_text}{source_note}"""
         else:
