@@ -21,14 +21,14 @@ HTTP_HEADERS = {
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 BAND_SHIFTS = {
-    (50, 55): {"fav_win": 22, "dog_win": -24, "revert": 52},
-    (55, 60): {"fav_win": 20, "dog_win": -25, "revert": 55},
-    (60, 65): {"fav_win": 18.5, "dog_win": -25, "revert": 56},
-    (65, 70): {"fav_win": 17, "dog_win": -26, "revert": 58},
-    (70, 75): {"fav_win": 13.6, "dog_win": -26, "revert": 60},
-    (75, 80): {"fav_win": 11.5, "dog_win": -24, "revert": 62},
-    (80, 85): {"fav_win": 9.5, "dog_win": -25, "revert": 65},
-    (85, 95): {"fav_win": 6, "dog_win": -24, "revert": 68},
+    (50, 55): {"fav_m1_dog_m2_delta": -2.1, "dog_m1_fav_m2_delta": -2.0},
+    (55, 60): {"fav_m1_dog_m2_delta": -1.6, "dog_m1_fav_m2_delta": -2.2},
+    (60, 65): {"fav_m1_dog_m2_delta": -4.5, "dog_m1_fav_m2_delta": -2.6},
+    (65, 70): {"fav_m1_dog_m2_delta": -6.1, "dog_m1_fav_m2_delta": -3.4},
+    (70, 75): {"fav_m1_dog_m2_delta": -5.7, "dog_m1_fav_m2_delta": -6.9},
+    (75, 80): {"fav_m1_dog_m2_delta": -8.4, "dog_m1_fav_m2_delta": -10.1},
+    (80, 85): {"fav_m1_dog_m2_delta": -10.1, "dog_m1_fav_m2_delta": -8.9},
+    (85, 96): {"fav_m1_dog_m2_delta": -8.0, "dog_m1_fav_m2_delta": -9.6},
 }
 
 MIN_SERIES_LIQUIDITY = 5_000
@@ -360,27 +360,29 @@ def forecast_split_prices(series, map1_winner, split_winner, state):
     if not band_data:
         return None
 
-    if map1_winner == prematch_fav:
-        fav_forecast = band_data["revert"]
+    if map1_winner == prematch_fav and split_winner != prematch_fav:
+        delta = band_data["fav_m1_dog_m2_delta"]
         note = "фаворит взяв К1, інша команда зрівнює 1:1"
-    else:
-        # Коли андердог забрав К1, а фаворит зрівнює К2, база повертається
-        # ближче до прематчевої ціни, зазвичай з меншою корекцією.
-        correction = 2 if prematch_fav_price < 70 else 4
-        fav_forecast = max(50, min(95, round(prematch_fav_price - correction)))
+    elif map1_winner != prematch_fav and split_winner == prematch_fav:
+        delta = band_data["dog_m1_fav_m2_delta"]
         note = "андердог взяв К1, фаворит зрівнює 1:1"
+    else:
+        return None
+
+    fav_forecast = max(0.1, min(99.9, round(prematch_fav_price + delta, 1)))
+    if float(fav_forecast).is_integer():
+        fav_forecast = int(fav_forecast)
 
     other = other_team_in_market(series, prematch_fav)
-    if split_winner == prematch_fav:
-        return {
-            prematch_fav: fav_forecast,
-            other: 100 - fav_forecast,
-            "note": note,
-        }
+    other_forecast = round(100 - fav_forecast, 1)
+    if float(other_forecast).is_integer():
+        other_forecast = int(other_forecast)
+
     return {
         prematch_fav: fav_forecast,
-        other: 100 - fav_forecast,
+        other: other_forecast,
         "note": note,
+        "delta": delta,
     }
 
 
@@ -636,8 +638,10 @@ async def msg3_map1_done(slug, data):
 
 🤖 Прогноз (база {band_text}, фаворит: {prematch_fav} {prematch_fav_price}¢):"""
         if split_forecast and fav_forecast is not None:
+            delta = split_forecast.get("delta")
+            delta_text = f" ({delta:+g}¢ від прематчу)" if delta is not None else ""
             msg += f"""
-  При 1:1 серія {prematch_fav} → ~{fav_forecast}¢{source_note}"""
+  При 1:1 серія {prematch_fav} → ~{fav_forecast}¢{delta_text}{source_note}"""
         else:
             msg += f"""
   При 1:1 прогноз серії треба звірити в базі вручну{source_note}"""
