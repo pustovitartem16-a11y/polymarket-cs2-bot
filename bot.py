@@ -400,8 +400,7 @@ def format_map_prices(data):
         if not market:
             continue
         lines.append(
-            f"🗺 <b>{label}:</b> {market['team1']} {market['price1']}¢ / "
-            f"{market['team2']} {market['price2']}¢"
+            f"🗺 <b>{label}:</b> {format_pair_line(market)}"
         )
     return "\n".join(lines)
 
@@ -517,7 +516,7 @@ async def msg1_match_found(slug, data):
 ⚔️ <b>{title}</b>
 🕐 Початок (Київ): {start}
 
-📊 <b>Серія:</b> {series['team1']} {series['price1']}¢ / {series['team2']} {series['price2']}¢
+📊 <b>Серія:</b> {format_pair_line(series)}
 💧 Об'єм серії: ${series['volume']:,.0f}"""
 
     map_lines = format_map_prices(data)
@@ -552,7 +551,7 @@ async def msg2_reminder(slug):
     msg = f"""⏰ <b>МАТЧ ЧЕРЕЗ 30 ХВИЛИН!</b>
 ⚔️ <b>{title}</b>
 
-📊 <b>Серія:</b> {series['team1']} {series['price1']}¢ / {series['team2']} {series['price2']}¢
+📊 <b>Серія:</b> {format_pair_line(series)}
 💧 Об'єм серії: ${series['volume']:,.0f}"""
 
     map_lines = format_map_prices(data)
@@ -745,10 +744,10 @@ async def msg4c_map3_live(slug, data):
 ⚔️ <b>{title}</b>
 
 📈 <b>Серія:</b>
-  {series['team1']} {series['price1']}¢ / {series['team2']} {series['price2']}¢
+  {format_pair_line(series)}
 
 🗺 <b>К3:</b>
-  {map3['team1']} {map3['price1']}¢ / {map3['team2']} {map3['price2']}¢
+  {format_pair_line(map3)}
   Об'єм: ${map3['volume']:,.0f}
 
 ⚡️ Якщо ти ще не закрив серію після 1:1 — перевір ціну прямо зараз."""
@@ -844,8 +843,7 @@ async def scan_matches():
                 if series["volume"] >= MIN_SERIES_LIQUIDITY:
                     # Якщо бот уперше побачив матч уже після К1/К2, не стрибаємо
                     # одразу в повідомлення про К2 без контексту.
-                    if stage in ["map1_done", "map2_live", "map2_done_sweep",
-                                 "map2_done_split", "map3_live"] \
+                    if stage in ["map1_done", "map2_live"] \
                             and not match_states[slug]["notified_map1"]:
                         match_states[slug]["notified_map1"] = True
                         await msg3_map1_done(slug, data)
@@ -902,8 +900,7 @@ async def check_active_matches():
                 state["stage"] = stage
 
                 # К1 закінчилась
-                if stage in ["map1_done", "map2_live", "map2_done_sweep",
-                             "map2_done_split", "map3_live", "finished"] \
+                if stage in ["map1_done", "map2_live"] \
                         and prev_stage in ["before", "map1_live"] \
                         and not state["notified_map1"]:
                     state["notified_map1"] = True
