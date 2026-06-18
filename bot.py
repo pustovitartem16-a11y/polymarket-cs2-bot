@@ -31,7 +31,7 @@ BAND_SHIFTS = {
     (85, 95): {"fav_win": 6, "dog_win": -24, "revert": 68},
 }
 
-MIN_SERIES_LIQUIDITY = 30_000
+MIN_SERIES_LIQUIDITY = 5_000
 MIN_MAP_LIQUIDITY = 3_000
 MAP_DONE_PRICE = 99.5
 SERIES_DONE_PRICE = 99.5
@@ -353,12 +353,8 @@ def forecast_split_prices(series, map1_winner, split_winner, state):
 
     prematch_fav = state.get("prematch_fav")
     prematch_fav_price = state.get("prematch_fav_price")
-    if not prematch_fav:
-        prematch_fav, prematch_fav_price = (
-            (series["team1"], series["price1"])
-            if series["price1"] >= series["price2"]
-            else (series["team2"], series["price2"])
-        )
+    if not prematch_fav or not prematch_fav_price or state.get("prematch_source") != "before":
+        return None
 
     _, band_data = get_band(prematch_fav_price)
     if not band_data:
@@ -618,6 +614,7 @@ async def msg3_map1_done(slug, data):
         series["team1"] if series["price1"] >= series["price2"] else series["team2"]
     )
     prematch_fav_price = state.get("prematch_fav_price") or max(series["price1"], series["price2"])
+    prematch_reliable = state.get("prematch_source") == "before"
     band_range, band_data = get_band(prematch_fav_price)
     calc_market = map2 if map2 and not map2.get("winner") else None
     calc_label = "К2"
@@ -645,15 +642,16 @@ async def msg3_map1_done(slug, data):
         fav_forecast = split_forecast.get(prematch_fav) if split_forecast else None
         band_text = f"{band_range[0]}-{band_range[1]}%" if band_range else "поза базою"
 
+        source_note = "" if prematch_reliable else "\n  ⚠️ Прематчева база не зафіксована ботом — прогноз вручну звірити в базі."
         msg += f"""
 
 🤖 Прогноз (база {band_text}, фаворит: {prematch_fav} {prematch_fav_price}¢):"""
         if split_forecast and fav_forecast is not None:
             msg += f"""
-  При 1:1 серія {prematch_fav} → ~{fav_forecast}¢"""
+  При 1:1 серія {prematch_fav} → ~{fav_forecast}¢{source_note}"""
         else:
-            msg += """
-  При 1:1 прогноз серії треба звірити в базі вручну"""
+            msg += f"""
+  При 1:1 прогноз серії треба звірити в базі вручну{source_note}"""
 
         msg += f"""
 
@@ -838,6 +836,7 @@ async def scan_matches():
                     "prematch_fav_price": max(series["price1"], series["price2"]),
                     "prematch_dog": series["team2"] if series["price1"] >= series["price2"] else series["team1"],
                     "prematch_dog_price": min(series["price1"], series["price2"]),
+                    "prematch_source": "before" if stage == "before" else "live_uncertain",
                 }
                 notified_slugs.add(slug)
 
@@ -850,9 +849,9 @@ async def scan_matches():
                     match_states[slug]["notified_reminder"] = True
                     await msg2_reminder(slug)
 
-                if series["volume"] >= MIN_SERIES_LIQUIDITY:
-                    await msg1_match_found(slug, data)
+                await msg1_match_found(slug, data)
 
+                if series["volume"] >= MIN_SERIES_LIQUIDITY:
                     # Якщо бот уперше побачив матч уже після К1/К2, не стрибаємо
                     # одразу в повідомлення про К2 без контексту.
                     if stage in ["map1_done", "map2_live", "map2_done_sweep",
@@ -880,7 +879,7 @@ async def scan_matches():
                         match_states[slug]["notified_map3"] = True
                         await msg4c_map3_live(slug, data)
                 else:
-                    print(f"[REMINDER ONLY] Мало ліквідності ${series['volume']:,.0f}: {data['title']}")
+                    print(f"[LOW LIQUIDITY] Лише знайдено/нагадування ${series['volume']:,.0f}: {data['title']}")
 
         except Exception as e:
             print(f"Помилка scan: {e}")
