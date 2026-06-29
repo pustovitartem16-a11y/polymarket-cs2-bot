@@ -31,11 +31,13 @@ BAND_SHIFTS = {
     (85, 96): {"fav_m1_dog_m2_delta": -8.0, "dog_m1_fav_m2_delta": -9.6},
 }
 
-MIN_SERIES_LIQUIDITY = 5_000
+MIN_SERIES_LIQUIDITY = 10_000
 MIN_MAP_LIQUIDITY = 3_000
 MAP_DONE_PRICE = 99.5
 SERIES_DONE_PRICE = 99.5
 STARTED_TOO_LONG_AGO_HOURS = 12
+REMINDER_SECONDS_BEFORE_START = 30 * 60
+REMINDER_LATE_GRACE_SECONDS = 10 * 60
 PRICE_SIDE = os.environ.get("POLYMARKET_PRICE_SIDE", "SELL").upper()
 
 match_states = {}
@@ -389,6 +391,27 @@ def forecast_split_prices(series, map1_winner, split_winner, state):
     }
 
 
+def series_forecast_after_map(series, map1_winner, map_winner, state):
+    if not series or not map1_winner or not map_winner:
+        return None
+
+    other = other_team_in_market(series, map_winner)
+    if not other:
+        return None
+
+    if map_winner == map1_winner:
+        return {
+            map_winner: 100,
+            other: 0,
+            "kind": "2:0 sweep",
+        }
+
+    forecast = forecast_split_prices(series, map1_winner, map_winner, state)
+    if forecast:
+        forecast["kind"] = "1:1 split"
+    return forecast
+
+
 def verdict_details(series, map1, band_range):
     reasons = []
     if not series or series["volume"] < MIN_SERIES_LIQUIDITY:
@@ -542,12 +565,14 @@ async def msg1_match_found(slug, data):
 async def msg2_reminder(slug):
     event, data = await get_parsed_event(slug)
     if not event:
-        return
+        return False
     series = data.get("series")
     map1 = data.get("map1")
     title = data.get("title", slug)
     if not series:
-        return
+        return False
+    if series["volume"] < MIN_SERIES_LIQUIDITY:
+        return False
 
     fav_price = max(series["price1"], series["price2"])
     band_range, _ = get_band(fav_price)
@@ -573,19 +598,43 @@ async def msg2_reminder(slug):
 
     await send_telegram(msg)
     print(f"[2] {title}")
+    return True
+
+
+async def maybe_send_due_reminder(slug, data=None):
+    state = match_states.get(slug, {})
+    if state.get("notified_reminder"):
+        return
+
+    start_date = (data or {}).get("start_date") or state.get("start_date", "")
+    if not start_date:
+        return
+
+    secs = seconds_until_start(start_date)
+    if secs > REMINDER_SECONDS_BEFORE_START or secs < -REMINDER_LATE_GRACE_SECONDS:
+        return
+
+    stage = state.get("stage") or (get_match_stage(data) if data else "")
+    if stage not in ["before", "map1_live"]:
+        return
+
+    sent = await msg2_reminder(slug)
+    if sent:
+        state["notified_reminder"] = True
 
 
 async def schedule_reminder(slug, start_date_str):
     if not start_date_str:
         return
     secs = seconds_until_start(start_date_str)
-    delay = secs - 30 * 60
+    delay = secs - REMINDER_SECONDS_BEFORE_START
     if delay > 0:
         await asyncio.sleep(delay)
     state = match_states.get(slug, {})
     if state.get("stage") in ["before", "map1_live"] and not state.get("notified_reminder"):
-        state["notified_reminder"] = True
-        await msg2_reminder(slug)
+        sent = await msg2_reminder(slug)
+        if sent:
+            state["notified_reminder"] = True
 
 
 # ============================================================
@@ -627,52 +676,77 @@ async def msg3_map1_done(slug, data):
         msg += f"🗺 {calc_label}: {format_pair_line(calc_market)}\n"
 
     if calc_market:
-        team_a = winner_k1 if winner_k1 in (calc_market["team1"], calc_market["team2"]) else calc_market["team1"]
-        team_b = other_team_in_market(calc_market, team_a) or calc_market["team2"]
-        s1, s2 = ordered_series_prices(series, team_a, team_b)
-        team_a_map = price_for_team(calc_market, team_a)
-        team_b_map = price_for_team(calc_market, team_b)
-        split_forecast = forecast_split_prices(series, winner_k1, team_b, state) if winner_k1 else None
-        fav_forecast = split_forecast.get(prematch_fav) if split_forecast else None
-        band_text = f"{band_range[0]}-{band_range[1]}%" if band_range else "поза базою"
-
-        source_note = "" if prematch_reliable else "\n  ⚠️ Прематчева база не зафіксована ботом — використовую live-ціну як наближення."
-        msg += f"""
-
-🤖 Прогноз (база {band_text}, фаворит: {prematch_fav} {prematch_fav_price}¢):"""
-        if split_forecast and fav_forecast is not None:
-            delta = split_forecast.get("delta")
-            delta_text = f" ({delta:+g}¢ від бази)" if delta is not None else ""
+        if not prematch_reliable:
             msg += f"""
-  При 1:1 серія {prematch_fav} → ~{fav_forecast}¢{delta_text}{source_note}"""
+
+⚠️ <b>Калькулятор автоматично не заповнюємо.</b>
+Бот не зафіксував прематчевого фаворита до старту матчу.
+Для цієї стратегії це критично: live-лідер після К1 може бути не прематчевим фаворитом.
+
+Перевір прематч вручну в базі/Polymarket, і тільки після цього заповнюй калькулятор."""
+        elif prematch_fav not in (calc_market["team1"], calc_market["team2"]):
+            msg += f"""
+
+⚠️ <b>Калькулятор автоматично не заповнюємо.</b>
+Прематчевий фаворит <b>{prematch_fav}</b> не знайдений у маркеті {calc_label}.
+Потрібна ручна перевірка назв команд."""
         else:
-            msg += f"""
-  При 1:1 прогноз серії треба звірити в базі вручну{source_note}"""
+            team_a = prematch_fav
+            team_b = other_team_in_market(calc_market, team_a) or calc_market["team2"]
+            s1, s2 = ordered_series_prices(series, team_a, team_b)
+            team_a_map = price_for_team(calc_market, team_a)
+            team_b_map = price_for_team(calc_market, team_b)
+            scenario_a = series_forecast_after_map(series, winner_k1, team_a, state)
+            scenario_b = series_forecast_after_map(series, winner_k1, team_b, state)
+            split_winner = other_team_in_market(calc_market, winner_k1)
+            split_forecast = forecast_split_prices(series, winner_k1, split_winner, state) if split_winner else None
+            fav_forecast = split_forecast.get(prematch_fav) if split_forecast else None
+            band_text = f"{band_range[0]}-{band_range[1]}%" if band_range else "поза базою"
 
-        msg += f"""
+            msg += f"""
+
+🤖 Прогноз (база {band_text}, прематч фаворит: {prematch_fav} {prematch_fav_price}¢):"""
+            if split_forecast and fav_forecast is not None:
+                delta = split_forecast.get("delta")
+                delta_text = f" ({delta:+g}¢ від бази)" if delta is not None else ""
+                msg += f"""
+  При 1:1 серія {prematch_fav} → ~{fav_forecast}¢{delta_text}"""
+            else:
+                msg += """
+  При 1:1 прогноз серії треба звірити в базі вручну"""
+
+            msg += f"""
 
 📋 <b>ЩО ВПИСАТИ В КАЛЬКУЛЯТОР:</b>
-Команда A (К1 переможець): <b>{team_a}</b>
+Команда A (прематч фаворит): <b>{team_a}</b>
 Команда A · Матч ({calc_label}): <b>{team_a_map if team_a_map is not None else "?"}</b>
 Команда A · Серія: <b>{s1 if s1 is not None else "?"}</b>
-Команда B: <b>{team_b}</b>
+Команда B (друга команда): <b>{team_b}</b>
 Команда B · Матч ({calc_label}): <b>{team_b_map if team_b_map is not None else "?"}</b>
-Команда B · Серія: <b>{s2 if s2 is not None else "?"}</b>
+Команда B · Серія: <b>{s2 if s2 is not None else "?"}</b>"""
 
-Якщо <b>{team_a}</b> бере {calc_label} (2:0 sweep):
-  {team_a} серія → <b>100</b>
-  {team_b} серія → <b>0</b>"""
+            if scenario_a:
+                msg += f"""
 
-        if split_forecast:
-            msg += f"""
+Якщо <b>{team_a}</b> бере {calc_label} ({scenario_a.get("kind", "?")}):
+  {team_a} серія → <b>{scenario_a.get(team_a, "?")}</b>
+  {team_b} серія → <b>{scenario_a.get(team_b, "?")}</b>"""
+            else:
+                msg += f"""
 
-Якщо <b>{team_b}</b> бере {calc_label} (1:1 split):
-  {team_a} серія → <b>{split_forecast.get(team_a, "?")}</b>
-  {team_b} серія → <b>{split_forecast.get(team_b, "?")}</b>"""
-        else:
-            msg += f"""
+Якщо <b>{team_a}</b> бере {calc_label}:
+  прогноз серії треба звірити вручну"""
 
-Якщо <b>{team_b}</b> бере {calc_label} (1:1 split):
+            if scenario_b:
+                msg += f"""
+
+Якщо <b>{team_b}</b> бере {calc_label} ({scenario_b.get("kind", "?")}):
+  {team_a} серія → <b>{scenario_b.get(team_a, "?")}</b>
+  {team_b} серія → <b>{scenario_b.get(team_b, "?")}</b>"""
+            else:
+                msg += f"""
+
+Якщо <b>{team_b}</b> бере {calc_label}:
   прогноз серії треба звірити вручну"""
     else:
         msg += "\n⚠️ К2/K3 Winner market не знайдено — калькулятор поки не заповнюємо."
@@ -808,6 +882,9 @@ async def scan_matches():
                 series = data.get("series")
                 if not series:
                     continue
+                if series["volume"] < MIN_SERIES_LIQUIDITY:
+                    print(f"[SKIP] Об'єм серії ${series['volume']:,.0f} < ${MIN_SERIES_LIQUIDITY:,.0f}: {data['title']}")
+                    continue
 
                 stage = get_match_stage(data)
 
@@ -837,44 +914,43 @@ async def scan_matches():
                 notified_slugs.add(slug)
 
                 if stage == "before":
-                    task = asyncio.create_task(
-                        schedule_reminder(slug, data.get("start_date", ""))
-                    )
-                    reminder_tasks[slug] = task
+                    if seconds_until_start(data.get("start_date", "")) <= REMINDER_SECONDS_BEFORE_START:
+                        await maybe_send_due_reminder(slug, data)
+                    else:
+                        task = asyncio.create_task(
+                            schedule_reminder(slug, data.get("start_date", ""))
+                        )
+                        reminder_tasks[slug] = task
                 elif stage == "map1_live" and not match_states[slug]["notified_reminder"]:
-                    match_states[slug]["notified_reminder"] = True
-                    await msg2_reminder(slug)
+                    await maybe_send_due_reminder(slug, data)
 
                 await msg1_match_found(slug, data)
 
-                if series["volume"] >= MIN_SERIES_LIQUIDITY:
-                    # Якщо бот уперше побачив матч уже після К1/К2, не стрибаємо
-                    # одразу в повідомлення про К2 без контексту.
-                    if stage in ["map1_done", "map2_live"] \
-                            and not match_states[slug]["notified_map1"]:
-                        match_states[slug]["notified_map1"] = True
-                        await msg3_map1_done(slug, data)
+                # Якщо бот уперше побачив матч уже після К1/К2, не стрибаємо
+                # одразу в повідомлення про К2 без контексту.
+                if stage in ["map1_done", "map2_live"] \
+                        and not match_states[slug]["notified_map1"]:
+                    match_states[slug]["notified_map1"] = True
+                    await msg3_map1_done(slug, data)
 
-                    if stage == "map2_done_sweep" and not match_states[slug]["notified_map2"]:
-                        match_states[slug]["notified_map2"] = True
-                        match_states[slug]["notified_final"] = True
-                        match_states[slug]["was_sweep"] = True
-                        await msg4a_sweep(slug, data)
+                if stage == "map2_done_sweep" and not match_states[slug]["notified_map2"]:
+                    match_states[slug]["notified_map2"] = True
+                    match_states[slug]["notified_final"] = True
+                    match_states[slug]["was_sweep"] = True
+                    await msg4a_sweep(slug, data)
 
-                    if stage in ["map2_done_split", "map3_live"] \
-                            and map2_result(data) == "split" \
-                            and not match_states[slug]["notified_map2"]:
-                        match_states[slug]["notified_map2"] = True
-                        await msg4b_split(slug, data)
-                        if data.get("map3"):
-                            match_states[slug]["notified_map3"] = True
-
-                    if stage == "map3_live" and data.get("map3") \
-                            and not match_states[slug]["notified_map3"]:
+                if stage in ["map2_done_split", "map3_live"] \
+                        and map2_result(data) == "split" \
+                        and not match_states[slug]["notified_map2"]:
+                    match_states[slug]["notified_map2"] = True
+                    await msg4b_split(slug, data)
+                    if data.get("map3"):
                         match_states[slug]["notified_map3"] = True
-                        await msg4c_map3_live(slug, data)
-                else:
-                    print(f"[LOW LIQUIDITY] Лише знайдено/нагадування ${series['volume']:,.0f}: {data['title']}")
+
+                if stage == "map3_live" and data.get("map3") \
+                        and not match_states[slug]["notified_map3"]:
+                    match_states[slug]["notified_map3"] = True
+                    await msg4c_map3_live(slug, data)
 
         except Exception as e:
             print(f"Помилка scan: {e}")
@@ -905,6 +981,7 @@ async def check_active_matches():
                 stage = get_match_stage(data)
                 prev_stage = state.get("stage", "before")
                 state["stage"] = stage
+                await maybe_send_due_reminder(slug, data)
 
                 # К1 закінчилась
                 if stage in ["map1_done", "map2_live"] \
