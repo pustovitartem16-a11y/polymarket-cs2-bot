@@ -526,41 +526,7 @@ def get_match_stage(data):
 
 
 # ============================================================
-# ПОВІДОМЛЕННЯ 1 — Матч знайдено
-# ============================================================
-async def msg1_match_found(slug, data):
-    series = data.get("series")
-    map1 = data.get("map1")
-    title = data.get("title", slug)
-    start = format_kyiv_time(data.get("start_date", ""))
-    fav_price = max(series["price1"], series["price2"])
-    band_range, _ = get_band(fav_price)
-    liq_ok, reasons = verdict_details(series, map1, band_range)
-    verdict_icon = "✅" if liq_ok else "⚠️"
-    verdict = "Кандидат по об'єму серії" if liq_ok else "Не кандидат"
-    details = "" if liq_ok else "\nПричини: " + "; ".join(reasons)
-
-    msg = f"""🔍 <b>ЗНАЙДЕНО CS2 МАТЧ</b>
-⚔️ <b>{title}</b>
-🕐 Початок (Київ): {start}
-
-📊 <b>Серія:</b> {format_pair_line(series)}
-💧 Об'єм серії: ${series['volume']:,.0f}"""
-
-    map_lines = format_map_prices(data)
-    if map_lines:
-        msg += f"\n{map_lines}"
-
-    msg += f"""
-
-{verdict_icon} <b>Вердикт:</b> {verdict}{details}"""
-
-    await send_telegram(msg)
-    print(f"[1] {title} | {start} | {verdict}")
-
-
-# ============================================================
-# ПОВІДОМЛЕННЯ 2 — Нагадування за 30 хвилин
+# ПОВІДОМЛЕННЯ 1 — Нагадування за 30 хвилин
 # ============================================================
 async def msg2_reminder(slug):
     event, data = await get_parsed_event(slug)
@@ -924,8 +890,6 @@ async def scan_matches():
                 elif stage == "map1_live" and not match_states[slug]["notified_reminder"]:
                     await maybe_send_due_reminder(slug, data)
 
-                await msg1_match_found(slug, data)
-
                 # Якщо бот уперше побачив матч уже після К1/К2, не стрибаємо
                 # одразу в повідомлення про К2 без контексту.
                 if stage in ["map1_done", "map2_live"] \
@@ -955,7 +919,7 @@ async def scan_matches():
         except Exception as e:
             print(f"Помилка scan: {e}")
 
-        await asyncio.sleep(120)
+        await asyncio.sleep(60)
 
 
 # ============================================================
@@ -1020,7 +984,7 @@ async def check_active_matches():
         except Exception as e:
             print(f"Помилка check: {e}")
 
-        await asyncio.sleep(90)
+        await asyncio.sleep(60)
 
 
 # ============================================================
@@ -1033,11 +997,10 @@ async def main():
         f"✅ <b>Polymarket CS2 бот запущений!</b>\n"
         f"🕐 Час Київ: {kyiv_time}\n\n"
         "Буду надсилати:\n"
-        "🔍 1 — матч знайдено\n"
-        "⏰ 2 — нагадування за 30 хв\n"
-        "🎮 3 — після К1 + калькулятор\n"
-        "🏆 4 — після К2 (sweep або 1:1)\n"
-        "🏁 5 — фінал після К3"
+        "⏰ 1 — нагадування за 30 хв\n"
+        "🎮 2 — після К1 + калькулятор\n"
+        "🏆 3 — після К2 (sweep або 1:1)\n"
+        "🏁 4 — фінал після К3"
     )
     await asyncio.gather(
         scan_matches(),
