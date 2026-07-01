@@ -33,7 +33,7 @@ BAND_SHIFTS = {
 
 MIN_SERIES_LIQUIDITY = 10_000
 MIN_MAP_LIQUIDITY = 3_000
-MAP_DONE_PRICE = 99.5
+MAP_DONE_PRICE = 98.0
 SERIES_DONE_PRICE = 99.5
 STARTED_TOO_LONG_AGO_HOURS = 12
 REMINDER_SECONDS_BEFORE_START = 30 * 60
@@ -226,6 +226,14 @@ async def apply_live_clob_prices(data):
             elif index == 1:
                 market["price2"] = cents(price)
             market["price_source"] = f"clob:{PRICE_SIDE}"
+
+        for market in markets:
+            if not market or market.get("winner"):
+                continue
+            threshold = SERIES_DONE_PRICE if market.get("is_series") else MAP_DONE_PRICE
+            winner = infer_winner_from_market_prices(market, threshold)
+            if winner:
+                market["winner"] = winner
     except Exception as e:
         print(f"Помилка CLOB prices: {e}")
 
@@ -271,6 +279,22 @@ def resolved_winner(outcomes, prices, market, threshold):
         return outcomes[0]
     if prices[1] > prices[0] and prices[1] * 100 >= threshold:
         return outcomes[1]
+    return None
+
+
+def infer_winner_from_market_prices(market_data, threshold):
+    if not market_data or market_data.get("winner"):
+        return market_data.get("winner") if market_data else None
+
+    price1 = market_data.get("price1")
+    price2 = market_data.get("price2")
+    if price1 is None or price2 is None:
+        return None
+
+    if price1 > price2 and price1 >= threshold:
+        return market_data.get("team1")
+    if price2 > price1 and price2 >= threshold:
+        return market_data.get("team2")
     return None
 
 
@@ -471,6 +495,7 @@ def parse_markets(event):
             "resolved": is_market_resolved(m),
             "token_ids": token_ids,
             "price_source": "gamma",
+            "is_series": is_series_market,
         }
         if is_series_market:
             result["series"] = md
@@ -518,6 +543,9 @@ def get_match_stage(data):
 
     if not has_started(data.get("start_date", "")):
         return "before"
+
+    if map1 and not is_live_market(map1) and is_live_market(map2):
+        return "map2_live"
 
     if is_live_market(map1):
         return "map1_live"
@@ -649,7 +677,13 @@ async def msg3_map1_done(slug, data):
         msg += f"🗺 {calc_label}: {format_pair_line(calc_market)}\n"
 
     if calc_market:
-        if not prematch_reliable:
+        if not winner_k1:
+            msg += f"""
+
+⚠️ <b>Калькулятор автоматично не заповнюємо.</b>
+Бот бачить, що наступний ринок уже активний, але не зміг точно визначити, хто взяв К1.
+Для цієї стратегії переможець К1 обов'язковий — перевір K1 вручну перед входом."""
+        elif not prematch_reliable:
             msg += f"""
 
 ⚠️ <b>Калькулятор автоматично не заповнюємо.</b>
