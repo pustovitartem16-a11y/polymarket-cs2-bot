@@ -118,6 +118,18 @@ def is_relevant_match(event):
     return True
 
 
+def is_bo3_match(data_or_event):
+    if data_or_event.get("map2") or data_or_event.get("map3"):
+        return True
+    title = (
+        data_or_event.get("title")
+        or data_or_event.get("question")
+        or data_or_event.get("slug")
+        or ""
+    )
+    return bool(re.search(r"\bbo3\b", title, re.IGNORECASE))
+
+
 def get_band(fav_price):
     for (lo, hi), data in BAND_SHIFTS.items():
         if lo <= fav_price < hi:
@@ -535,6 +547,8 @@ async def msg2_reminder(slug):
     series = data.get("series")
     map1 = data.get("map1")
     title = data.get("title", slug)
+    if not is_bo3_match(data):
+        return False
     if not series:
         return False
     if series["volume"] < MIN_SERIES_LIQUIDITY:
@@ -612,12 +626,15 @@ async def msg3_map1_done(slug, data):
     map2 = data.get("map2")
     map3 = data.get("map3")
     title = data.get("title", slug)
+    if not is_bo3_match(data):
+        return
     if not series or series["volume"] < MIN_SERIES_LIQUIDITY:
         return
 
-    state = match_states.get(slug, {})
+    state = match_states.setdefault(slug, {})
+    state["strategy_active"] = False
     winner_k1 = map1.get("winner") if map1 else None
-    match_states[slug]["map1_winner"] = winner_k1
+    state["map1_winner"] = winner_k1
 
     prematch_fav = state.get("prematch_fav") or (
         series["team1"] if series["price1"] >= series["price2"] else series["team2"]
@@ -668,6 +685,17 @@ async def msg3_map1_done(slug, data):
             split_forecast = forecast_split_prices(series, winner_k1, split_winner, state) if split_winner else None
             fav_forecast = split_forecast.get(prematch_fav) if split_forecast else None
             band_text = f"{band_range[0]}-{band_range[1]}%" if band_range else "поза базою"
+            if (
+                winner_k1
+                and team_a_map is not None
+                and team_b_map is not None
+                and s1 is not None
+                and s2 is not None
+                and scenario_a
+                and scenario_b
+                and split_forecast
+            ):
+                state["strategy_active"] = True
 
             msg += f"""
 
@@ -689,7 +717,12 @@ async def msg3_map1_done(slug, data):
 Команда A · Серія: <b>{s1 if s1 is not None else "?"}</b>
 Команда B (друга команда): <b>{team_b}</b>
 Команда B · Матч ({calc_label}): <b>{team_b_map if team_b_map is not None else "?"}</b>
-Команда B · Серія: <b>{s2 if s2 is not None else "?"}</b>"""
+Команда B · Серія: <b>{s2 if s2 is not None else "?"}</b>
+
+⚠️ <b>Не плутай ноги:</b>
+Матч = саме ринок {calc_label} Winner.
+Серія = переможець BO3 / Match Winner.
+Купуй тільки зелену RECOMMENDED конструкцію з калькулятора."""
 
             if scenario_a:
                 msg += f"""
@@ -848,6 +881,10 @@ async def scan_matches():
                 series = data.get("series")
                 if not series:
                     continue
+                if not is_bo3_match(data):
+                    notified_slugs.add(slug)
+                    print(f"[SKIP] Не BO3: {data['title']}")
+                    continue
                 if series["volume"] < MIN_SERIES_LIQUIDITY:
                     print(f"[SKIP] Об'єм серії ${series['volume']:,.0f} < ${MIN_SERIES_LIQUIDITY:,.0f}: {data['title']}")
                     continue
@@ -876,6 +913,7 @@ async def scan_matches():
                     "prematch_dog": series["team2"] if series["price1"] >= series["price2"] else series["team1"],
                     "prematch_dog_price": min(series["price1"], series["price2"]),
                     "prematch_source": "before" if stage == "before" else "live_uncertain",
+                    "strategy_active": False,
                 }
                 notified_slugs.add(slug)
 
@@ -897,13 +935,16 @@ async def scan_matches():
                     match_states[slug]["notified_map1"] = True
                     await msg3_map1_done(slug, data)
 
-                if stage == "map2_done_sweep" and not match_states[slug]["notified_map2"]:
+                strategy_active = match_states[slug].get("strategy_active")
+
+                if strategy_active and stage == "map2_done_sweep" and not match_states[slug]["notified_map2"]:
                     match_states[slug]["notified_map2"] = True
                     match_states[slug]["notified_final"] = True
                     match_states[slug]["was_sweep"] = True
                     await msg4a_sweep(slug, data)
 
-                if stage in ["map2_done_split", "map3_live"] \
+                if strategy_active \
+                        and stage in ["map2_done_split", "map3_live"] \
                         and map2_result(data) == "split" \
                         and not match_states[slug]["notified_map2"]:
                     match_states[slug]["notified_map2"] = True
@@ -911,7 +952,8 @@ async def scan_matches():
                     if data.get("map3"):
                         match_states[slug]["notified_map3"] = True
 
-                if stage == "map3_live" and data.get("map3") \
+                if strategy_active \
+                        and stage == "map3_live" and data.get("map3") \
                         and not match_states[slug]["notified_map3"]:
                     match_states[slug]["notified_map3"] = True
                     await msg4c_map3_live(slug, data)
@@ -941,11 +983,15 @@ async def check_active_matches():
                 series = data.get("series")
                 if not series or series["volume"] < MIN_SERIES_LIQUIDITY:
                     continue
+                if not is_bo3_match(data):
+                    state["notified_final"] = True
+                    continue
 
                 stage = get_match_stage(data)
                 prev_stage = state.get("stage", "before")
                 state["stage"] = stage
                 await maybe_send_due_reminder(slug, data)
+                strategy_active = state.get("strategy_active")
 
                 # К1 закінчилась
                 if stage in ["map1_done", "map2_live"] \
@@ -955,14 +1001,15 @@ async def check_active_matches():
                     await msg3_map1_done(slug, data)
 
                 # Sweep 2:0
-                if stage == "map2_done_sweep" and not state["notified_map2"]:
+                if strategy_active and stage == "map2_done_sweep" and not state["notified_map2"]:
                     state["notified_map2"] = True
                     state["notified_final"] = True
                     state["was_sweep"] = True
                     await msg4a_sweep(slug, data)
 
                 # Split 1:1
-                if stage in ["map2_done_split", "map3_live"] \
+                if strategy_active \
+                        and stage in ["map2_done_split", "map3_live"] \
                         and map2_result(data) == "split" \
                         and not state["notified_map2"]:
                     state["notified_map2"] = True
@@ -971,12 +1018,12 @@ async def check_active_matches():
                         state["notified_map3"] = True
 
                 # К3 з'явилась вже після повідомлення про split
-                if stage == "map3_live" and data.get("map3") and not state.get("notified_map3"):
+                if strategy_active and stage == "map3_live" and data.get("map3") and not state.get("notified_map3"):
                     state["notified_map3"] = True
                     await msg4c_map3_live(slug, data)
 
                 # Фінал після К3
-                if stage == "finished" and not state["notified_final"]:
+                if strategy_active and stage == "finished" and not state["notified_final"]:
                     state["notified_final"] = True
                     if not state.get("was_sweep"):
                         await msg5_final(slug, data)
@@ -997,7 +1044,7 @@ async def main():
         f"✅ <b>Polymarket CS2 бот запущений!</b>\n"
         f"🕐 Час Київ: {kyiv_time}\n\n"
         "Буду надсилати:\n"
-        "⏰ 1 — нагадування за 30 хв\n"
+        "⏰ 1 — нагадування за 30 хв (тільки BO3)\n"
         "🎮 2 — після К1 + калькулятор\n"
         "🏆 3 — після К2 (sweep або 1:1)\n"
         "🏁 4 — фінал після К3"
