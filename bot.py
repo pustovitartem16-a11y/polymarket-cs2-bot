@@ -118,18 +118,6 @@ def is_relevant_match(event):
     return True
 
 
-def is_bo3_match(data_or_event):
-    if data_or_event.get("map2") or data_or_event.get("map3"):
-        return True
-    title = (
-        data_or_event.get("title")
-        or data_or_event.get("question")
-        or data_or_event.get("slug")
-        or ""
-    )
-    return bool(re.search(r"\bbo3\b", title, re.IGNORECASE))
-
-
 def get_band(fav_price):
     for (lo, hi), data in BAND_SHIFTS.items():
         if lo <= fav_price < hi:
@@ -547,12 +535,11 @@ async def msg2_reminder(slug):
     series = data.get("series")
     map1 = data.get("map1")
     title = data.get("title", slug)
-    if not is_bo3_match(data):
-        return False
     if not series:
         return False
     if series["volume"] < MIN_SERIES_LIQUIDITY:
         return False
+    has_map_markets = bool(data.get("map1") or data.get("map2") or data.get("map3"))
 
     fav_price = max(series["price1"], series["price2"])
     band_range, _ = get_band(fav_price)
@@ -568,13 +555,18 @@ async def msg2_reminder(slug):
     if map_lines:
         msg += f"\n{map_lines}"
 
-    if liq_ok:
+    if liq_ok and has_map_markets:
         msg += "\n\n✅ <b>Вердикт:</b> Кандидат по об'єму серії — чекаємо завершення К1"
+    elif liq_ok:
+        msg += "\n\n✅ <b>Вердикт:</b> Кандидат по об'єму серії — чекаю, чи підтягнуться карти K1/K2"
     else:
         msg += "\n\n⚠️ <b>Вердикт:</b> Не кандидат"
         msg += "\nПричини: " + "; ".join(reasons)
 
-    msg += "\n\n📌 Прогноз і числа для калькулятора прийдуть після К1."
+    if has_map_markets:
+        msg += "\n\n📌 Прогноз і числа для калькулятора прийдуть після К1."
+    else:
+        msg += "\n\n📌 Калькулятор буде тільки якщо Polymarket підтягне ринки K1/K2."
 
     await send_telegram(msg)
     print(f"[2] {title}")
@@ -626,8 +618,6 @@ async def msg3_map1_done(slug, data):
     map2 = data.get("map2")
     map3 = data.get("map3")
     title = data.get("title", slug)
-    if not is_bo3_match(data):
-        return
     if not series or series["volume"] < MIN_SERIES_LIQUIDITY:
         return
 
@@ -721,7 +711,7 @@ async def msg3_map1_done(slug, data):
 
 ⚠️ <b>Не плутай ноги:</b>
 Матч = саме ринок {calc_label} Winner.
-Серія = переможець BO3 / Match Winner.
+Серія = переможець серії / Match Winner.
 Купуй тільки зелену RECOMMENDED конструкцію з калькулятора."""
 
             if scenario_a:
@@ -881,10 +871,6 @@ async def scan_matches():
                 series = data.get("series")
                 if not series:
                     continue
-                if not is_bo3_match(data):
-                    notified_slugs.add(slug)
-                    print(f"[SKIP] Не BO3: {data['title']}")
-                    continue
                 if series["volume"] < MIN_SERIES_LIQUIDITY:
                     print(f"[SKIP] Об'єм серії ${series['volume']:,.0f} < ${MIN_SERIES_LIQUIDITY:,.0f}: {data['title']}")
                     continue
@@ -983,9 +969,6 @@ async def check_active_matches():
                 series = data.get("series")
                 if not series or series["volume"] < MIN_SERIES_LIQUIDITY:
                     continue
-                if not is_bo3_match(data):
-                    state["notified_final"] = True
-                    continue
 
                 stage = get_match_stage(data)
                 prev_stage = state.get("stage", "before")
@@ -1044,7 +1027,7 @@ async def main():
         f"✅ <b>Polymarket CS2 бот запущений!</b>\n"
         f"🕐 Час Київ: {kyiv_time}\n\n"
         "Буду надсилати:\n"
-        "⏰ 1 — нагадування за 30 хв (тільки BO3)\n"
+        "⏰ 1 — нагадування за 30 хв\n"
         "🎮 2 — після К1 + калькулятор\n"
         "🏆 3 — після К2 (sweep або 1:1)\n"
         "🏁 4 — фінал після К3"
